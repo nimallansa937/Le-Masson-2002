@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from circuit.thalamic_circuit import ThalamicCircuit
 from analysis.oscillation import (
     detect_spindles, spindle_frequency, spindle_duration,
-    oscillation_power, is_oscillating, analyse_burst_pauses
+    oscillation_power, is_oscillating, analyse_burst_pauses,
+    find_bifurcation_threshold
 )
 from analysis.spike_analysis import contribution_index, correlation_index, spike_latency
 
@@ -46,7 +47,6 @@ def run_single_gaba(args):
 
     # Burst-pause analysis (primary oscillation metric)
     bp_stats = analyse_burst_pauses(sim['tc_spike_times'], pause_threshold_ms=50.0)
-    osc = is_oscillating(sim['tc_spike_times'], duration_s)
     power = oscillation_power(sim['V_tc'], sim['t'])
 
     # Envelope-based spindle detection (secondary)
@@ -61,7 +61,7 @@ def run_single_gaba(args):
 
     return {
         'gaba_gmax': float(gmax),
-        'oscillating': bool(osc),
+        'oscillating': False,  # Set post-hoc by EC50 threshold in main()
         'oscillation_power': float(power),
         'pause_rate_hz': float(bp_stats['pause_rate_hz']),
         'n_pauses': bp_stats['n_pauses'],
@@ -137,12 +137,16 @@ def main():
     # Sort by GABA value
     results.sort(key=lambda r: r['gaba_gmax'])
 
-    # Find threshold
-    threshold = None
+    # Find threshold using EC50 (half-maximal rise) of pause_rate
+    # This accounts for the non-zero baseline from retinal ISI variability
+    threshold_pr = find_bifurcation_threshold(results, metric='pause_rate_hz')
+    threshold_bf = find_bifurcation_threshold(results, metric='burst_fraction')
+    threshold = round(threshold_pr, 1) if not np.isnan(threshold_pr) else None
+
+    # Mark oscillating based on threshold (post-hoc)
     for r in results:
-        if r['oscillating']:
-            threshold = r['gaba_gmax']
-            break
+        r['oscillating'] = (threshold is not None
+                            and r['gaba_gmax'] >= threshold)
 
     # Print summary
     print(f"\nCompleted in {elapsed:.1f}s ({elapsed/60:.1f} min)")
@@ -159,12 +163,15 @@ def main():
               f"{r['tc_rate_hz']:>6.1f}")
 
     print(f"\n{'=' * 60}")
-    print(f"BIFURCATION THRESHOLD: {threshold} nS")
-    print(f"TARGET (Le Masson):    29.0 +/- 4.2 nS")
+    print(f"THRESHOLD (pause_rate EC50): {threshold_pr:.1f} nS")
+    print(f"THRESHOLD (burst_frac EC50): {threshold_bf:.1f} nS")
+    print(f"BIFURCATION THRESHOLD:       {threshold} nS")
+    print(f"TARGET (Le Masson):          29.0 +/- 4.2 nS")
     if threshold is not None:
         dev = abs(threshold - 29.0)
-        print(f"DEVIATION:             {dev:.1f} nS")
-        print(f"WITHIN 1 SD:           {dev <= 4.2}")
+        print(f"DEVIATION:                   {dev:.1f} nS")
+        print(f"WITHIN 1 SD:                 {dev <= 4.2}")
+        print(f"WITHIN 2 SD:                 {dev <= 8.4}")
     print(f"{'=' * 60}")
 
     # Save results
@@ -214,17 +221,23 @@ def _generate_figures(results, threshold):
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
 
-    # Panel 1: Pause rate (primary bifurcation metric)
+    # Panel 1: Pause rate (primary bifurcation metric) with EC50 line
     axes[0].plot(gaba, pause_rate, 'ko-', markersize=5, linewidth=1.5)
     axes[0].set_ylabel('Pause Rate (Hz)')
-    axes[0].axhline(1.0, color='gray', linestyle=':', linewidth=1,
-                    label='Oscillation threshold (1 Hz)')
+    # Show EC50 level
+    baseline_pr = np.mean(pause_rate[:3]) if len(pause_rate) >= 3 else pause_rate[0]
+    ceiling_pr = np.mean(pause_rate[-5:]) if len(pause_rate) >= 5 else pause_rate[-1]
+    ec50_level = baseline_pr + 0.5 * (ceiling_pr - baseline_pr)
+    axes[0].axhline(ec50_level, color='gray', linestyle=':', linewidth=1,
+                    label=f'EC50 = {ec50_level:.1f} Hz')
+    axes[0].axhline(baseline_pr, color='lightblue', linestyle=':', linewidth=1,
+                    alpha=0.7, label=f'Baseline = {baseline_pr:.1f} Hz')
     axes[0].axvline(29.0, color='red', linestyle='--', linewidth=1.5,
                     label='Le Masson = 29 nS')
     if threshold is not None:
         axes[0].axvline(threshold, color='blue', linestyle='--', linewidth=1.5,
                         label=f'Model = {threshold} nS')
-    axes[0].legend()
+    axes[0].legend(fontsize=8)
     axes[0].set_title('Bifurcation Diagram — Le Masson 2002 Replication')
     axes[0].grid(True, alpha=0.3)
 

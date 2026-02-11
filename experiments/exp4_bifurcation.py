@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from circuit.thalamic_circuit import ThalamicCircuit
 from analysis.oscillation import (
     detect_spindles, spindle_frequency, spindle_duration,
-    oscillation_power, is_oscillating, analyse_burst_pauses
+    oscillation_power, is_oscillating, analyse_burst_pauses,
+    find_bifurcation_threshold
 )
 from analysis.spike_analysis import contribution_index, correlation_index
 from analysis.plotting import plot_bifurcation, plot_voltage_traces, ensure_figures_dir
@@ -75,12 +76,14 @@ def run_experiment(duration_s=60.0, gaba_values=None, retinal_rate=42.0,
         record_dt = 0.001 if duration_s > 10 else None
         sim = circuit.simulate(duration_s, record_dt=record_dt)
 
-        # Oscillation metrics
+        # Burst-pause analysis (primary metric)
+        bp_stats = analyse_burst_pauses(sim['tc_spike_times'], pause_threshold_ms=50.0)
+        power = oscillation_power(sim['V_tc'], sim['t'])
+
+        # Envelope-based spindle detection (secondary)
         spindles = detect_spindles(sim['V_tc'], sim['t'])
         freq_mean, _ = spindle_frequency(spindles)
         dur_mean, _ = spindle_duration(spindles)
-        osc = is_oscillating(sim['tc_spike_times'], duration_s)
-        power = oscillation_power(sim['V_tc'], sim['t'])
 
         # Correlation metrics
         ci = contribution_index(
@@ -90,8 +93,10 @@ def run_experiment(duration_s=60.0, gaba_values=None, retinal_rate=42.0,
 
         result = {
             'gaba_gmax': gmax,
-            'oscillating': osc,
+            'oscillating': False,  # Set post-hoc by EC50 threshold
             'oscillation_power': power,
+            'pause_rate_hz': bp_stats['pause_rate_hz'],
+            'burst_fraction': bp_stats['burst_fraction'],
             'n_spindles': len(spindles),
             'spindle_freq_Hz': freq_mean,
             'spindle_dur_s': dur_mean,
@@ -103,15 +108,20 @@ def run_experiment(duration_s=60.0, gaba_values=None, retinal_rate=42.0,
         all_results.append(result)
 
         if verbose:
-            print(f"  Osc={osc}, Power={power:.2e}, Spindles={len(spindles)}, "
+            print(f"  PauseRate={bp_stats['pause_rate_hz']:.2f}, "
+                  f"Power={power:.2e}, Spindles={len(spindles)}, "
                   f"CI={ci:.4f}, TC rate={result['tc_rate_hz']:.1f} Hz")
 
-    # --- Find bifurcation threshold ---
-    gaba_vals = np.array([r['gaba_gmax'] for r in all_results])
-    osc_flags = np.array([r['oscillating'] for r in all_results])
-    powers = np.array([r['oscillation_power'] for r in all_results])
+    # --- Find bifurcation threshold using EC50 ---
+    threshold_pr = find_bifurcation_threshold(all_results, metric='pause_rate_hz')
+    threshold_bf = find_bifurcation_threshold(all_results, metric='burst_fraction')
+    threshold = round(threshold_pr, 1) if not np.isnan(threshold_pr) else _find_threshold(
+        np.array([r['gaba_gmax'] for r in all_results]),
+        np.array([r['oscillating'] for r in all_results]))
 
-    threshold = _find_threshold(gaba_vals, osc_flags)
+    # Mark oscillating post-hoc based on EC50 threshold
+    for r in all_results:
+        r['oscillating'] = (r['gaba_gmax'] >= threshold)
 
     # --- Generate figures ---
     _generate_figures(all_results, threshold)

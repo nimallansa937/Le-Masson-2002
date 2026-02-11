@@ -215,6 +215,10 @@ def is_oscillating(tc_spike_times, duration_s, pause_threshold_ms=50.0,
     trace morphology. The circuit is oscillating when GABA feedback
     produces a sustained rate of inhibition-mediated pauses.
 
+    NOTE: For single-trial classification this uses a fixed pause-rate
+    threshold. For bifurcation analysis across a GABA sweep, use
+    find_bifurcation_threshold() which baseline-normalises the metric.
+
     Parameters
     ----------
     tc_spike_times : np.ndarray
@@ -233,3 +237,63 @@ def is_oscillating(tc_spike_times, duration_s, pause_threshold_ms=50.0,
     """
     stats = analyse_burst_pauses(tc_spike_times, pause_threshold_ms)
     return stats['pause_rate_hz'] >= min_pause_rate_hz
+
+
+def find_bifurcation_threshold(results, metric='pause_rate_hz',
+                               n_baseline=3, n_ceiling=5, ec_frac=0.5):
+    """Find the GABA bifurcation threshold using EC50-style normalisation.
+
+    The pause_rate (and burst_fraction) have a non-zero floor even at
+    GABA=0 because gamma-distributed retinal ISIs occasionally exceed
+    the pause threshold. This function:
+      1. Estimates the baseline from the lowest GABA values
+      2. Estimates the ceiling from the highest GABA values
+      3. Finds the GABA value where the metric crosses the half-maximal
+         point (EC50) between baseline and ceiling
+
+    Parameters
+    ----------
+    results : list of dict
+        Sorted by gaba_gmax, each dict must have 'gaba_gmax' and the
+        metric key.
+    metric : str
+        Which metric to use: 'pause_rate_hz' or 'burst_fraction'.
+    n_baseline : int
+        Number of lowest-GABA points to average for baseline.
+    n_ceiling : int
+        Number of highest-GABA points to average for ceiling.
+    ec_frac : float
+        Fractional rise point (0.5 = half-maximal, i.e. EC50).
+
+    Returns
+    -------
+    threshold : float
+        Estimated GABA bifurcation threshold (nS).
+        Returns NaN if threshold cannot be determined.
+    """
+    if len(results) < n_baseline + n_ceiling:
+        return float('nan')
+
+    vals = np.array([r[metric] for r in results])
+    gaba = np.array([r['gaba_gmax'] for r in results])
+
+    baseline = np.mean(vals[:n_baseline])
+    ceiling = np.mean(vals[-n_ceiling:])
+    dynamic_range = ceiling - baseline
+
+    if dynamic_range <= 0:
+        return float('nan')
+
+    target = baseline + ec_frac * dynamic_range
+
+    # Find where vals crosses target (linear interpolation)
+    for i in range(len(vals) - 1):
+        if vals[i] < target <= vals[i + 1]:
+            # Linear interpolation between points i and i+1
+            frac = (target - vals[i]) / (vals[i + 1] - vals[i])
+            return float(gaba[i] + frac * (gaba[i + 1] - gaba[i]))
+        elif vals[i] >= target:
+            # Already above at this point
+            return float(gaba[i])
+
+    return float('nan')
