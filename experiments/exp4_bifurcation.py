@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from circuit.thalamic_circuit import ThalamicCircuit
 from analysis.oscillation import (
     detect_spindles, spindle_frequency, spindle_duration,
-    oscillation_power, is_oscillating
+    oscillation_power, is_oscillating, analyse_burst_pauses
 )
 from analysis.spike_analysis import contribution_index, correlation_index
 from analysis.plotting import plot_bifurcation, plot_voltage_traces, ensure_figures_dir
@@ -79,7 +79,7 @@ def run_experiment(duration_s=60.0, gaba_values=None, retinal_rate=42.0,
         spindles = detect_spindles(sim['V_tc'], sim['t'])
         freq_mean, _ = spindle_frequency(spindles)
         dur_mean, _ = spindle_duration(spindles)
-        osc = is_oscillating(sim['V_tc'], sim['t'])
+        osc = is_oscillating(sim['tc_spike_times'], duration_s)
         power = oscillation_power(sim['V_tc'], sim['t'])
 
         # Correlation metrics
@@ -259,7 +259,7 @@ def run_sensitivity_analysis(duration_s=30.0, dt=0.025e-3, seed=42, verbose=True
                 tc_params=tc_params
             )
             sim = circuit.simulate(duration_s, record_dt=0.001)
-            osc = is_oscillating(sim['V_tc'], sim['t'])
+            osc = is_oscillating(sim['tc_spike_times'], duration_s)
             results_iT.append({'gaba_gmax': gmax, 'oscillating': osc})
         osc_flags = [r['oscillating'] for r in results_iT]
         thresh = _find_threshold(gaba_vals, osc_flags)

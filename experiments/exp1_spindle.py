@@ -20,7 +20,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from circuit.thalamic_circuit import ThalamicCircuit
-from analysis.oscillation import detect_spindles, spindle_frequency, spindle_duration, is_oscillating, oscillation_power
+from analysis.oscillation import detect_spindles, spindle_frequency, spindle_duration, is_oscillating, oscillation_power, analyse_burst_pauses
 from analysis.plotting import plot_voltage_traces, ensure_figures_dir
 
 
@@ -71,7 +71,7 @@ def run_experiment(duration_s=60.0, gaba_values=None, retinal_rate=42.0,
         spindles = detect_spindles(sim['V_tc'], sim['t'])
         freq_mean, freq_std = spindle_frequency(spindles)
         dur_mean, dur_std = spindle_duration(spindles)
-        osc = is_oscillating(sim['V_tc'], sim['t'])
+        osc = is_oscillating(sim['tc_spike_times'], duration_s)
         power = oscillation_power(sim['V_tc'], sim['t'])
 
         result = {

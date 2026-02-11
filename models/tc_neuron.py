@@ -32,8 +32,8 @@ class TCNeuron:
         # Maximal conductances (mS/cm2)
         self.g_Na = p.get('g_Na', 90.0)
         self.g_K = p.get('g_K', 10.0)
-        self.g_T = p.get('g_T', 2.2)
-        self.g_h = p.get('g_h', 0.02)
+        self.g_T = p.get('g_T', 2.0)
+        self.g_h = p.get('g_h', 0.05)
         self.g_L = p.get('g_L', 0.02)
         self.g_KL = p.get('g_KL', 0.03)
 

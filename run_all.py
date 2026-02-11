@@ -32,7 +32,7 @@ def run_quick_test():
     circuit = ThalamicCircuit(gaba_gmax_total=0, retinal_rate=42.0,
                               gamma_order=1.5, seed=42)
     sim = circuit.simulate(2.0, record_dt=0.0005)
-    osc = is_oscillating(sim['V_tc'], sim['t'])
+    osc = is_oscillating(sim['tc_spike_times'], sim['duration_s'])
     print(f"  TC spikes: {len(sim['tc_spike_times'])}")
     print(f"  nRt spikes: {len(sim['nrt_spike_times'])}")
     print(f"  Oscillating: {osc} (expected: False)")
@@ -44,7 +44,7 @@ def run_quick_test():
     circuit = ThalamicCircuit(gaba_gmax_total=50, retinal_rate=42.0,
                               gamma_order=1.5, seed=42)
     sim = circuit.simulate(2.0, record_dt=0.0005)
-    osc = is_oscillating(sim['V_tc'], sim['t'])
+    osc = is_oscillating(sim['tc_spike_times'], sim['duration_s'])
     power = oscillation_power(sim['V_tc'], sim['t'])
     print(f"  TC spikes: {len(sim['tc_spike_times'])}")
     print(f"  nRt spikes: {len(sim['nrt_spike_times'])}")

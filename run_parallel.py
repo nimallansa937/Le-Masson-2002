@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from circuit.thalamic_circuit import ThalamicCircuit
 from analysis.oscillation import (
     detect_spindles, spindle_frequency, spindle_duration,
-    oscillation_power, is_oscillating
+    oscillation_power, is_oscillating, analyse_burst_pauses
 )
 from analysis.spike_analysis import contribution_index, correlation_index, spike_latency
 
@@ -44,12 +44,15 @@ def run_single_gaba(args):
     record_dt = 0.001 if duration_s > 10 else 0.0005
     sim = circuit.simulate(duration_s, record_dt=record_dt)
 
-    # Oscillation metrics
+    # Burst-pause analysis (primary oscillation metric)
+    bp_stats = analyse_burst_pauses(sim['tc_spike_times'], pause_threshold_ms=50.0)
+    osc = is_oscillating(sim['tc_spike_times'], duration_s)
+    power = oscillation_power(sim['V_tc'], sim['t'])
+
+    # Envelope-based spindle detection (secondary)
     spindles = detect_spindles(sim['V_tc'], sim['t'])
     freq_mean, freq_std = spindle_frequency(spindles)
     dur_mean, dur_std = spindle_duration(spindles)
-    osc = is_oscillating(sim['V_tc'], sim['t'])
-    power = oscillation_power(sim['V_tc'], sim['t'])
 
     # Correlation metrics
     ci = contribution_index(sim['retinal_spike_times'], sim['tc_spike_times'])
@@ -60,6 +63,11 @@ def run_single_gaba(args):
         'gaba_gmax': float(gmax),
         'oscillating': bool(osc),
         'oscillation_power': float(power),
+        'pause_rate_hz': float(bp_stats['pause_rate_hz']),
+        'n_pauses': bp_stats['n_pauses'],
+        'n_bursts': bp_stats['n_bursts'],
+        'burst_fraction': float(bp_stats['burst_fraction']),
+        'estimated_freq_hz': float(bp_stats['estimated_freq_hz']) if not np.isnan(bp_stats['estimated_freq_hz']) else None,
         'n_spindles': len(spindles),
         'spindle_freq_Hz': float(freq_mean) if not np.isnan(freq_mean) else None,
         'spindle_freq_std': float(freq_std) if not np.isnan(freq_std) else None,
@@ -138,14 +146,17 @@ def main():
 
     # Print summary
     print(f"\nCompleted in {elapsed:.1f}s ({elapsed/60:.1f} min)")
-    print(f"\n{'GABA (nS)':>10} {'Osc':>5} {'Power':>12} {'Spindles':>9} "
-          f"{'Freq (Hz)':>10} {'CI':>8} {'TC rate':>8}")
-    print("-" * 75)
+    print(f"\n{'GABA(nS)':>8} {'Osc':>4} {'PauseRate':>9} {'Pauses':>7} "
+          f"{'Bursts':>7} {'BurstFr':>7} {'EstFreq':>8} "
+          f"{'Power':>10} {'CI':>7} {'TC Hz':>6}")
+    print("-" * 90)
     for r in results:
-        freq = f"{r['spindle_freq_Hz']:.2f}" if r['spindle_freq_Hz'] else "N/A"
-        print(f"{r['gaba_gmax']:>10.1f} {'Y' if r['oscillating'] else 'N':>5} "
-              f"{r['oscillation_power']:>12.2e} {r['n_spindles']:>9} "
-              f"{freq:>10} {r['CI']:>8.4f} {r['tc_rate_hz']:>8.1f}")
+        ef = f"{r['estimated_freq_hz']:.1f}" if r.get('estimated_freq_hz') else "N/A"
+        print(f"{r['gaba_gmax']:>8.1f} {'Y' if r['oscillating'] else 'N':>4} "
+              f"{r['pause_rate_hz']:>9.2f} {r['n_pauses']:>7} "
+              f"{r['n_bursts']:>7} {r['burst_fraction']:>7.2f} {ef:>8} "
+              f"{r['oscillation_power']:>10.2e} {r['CI']:>7.4f} "
+              f"{r['tc_rate_hz']:>6.1f}")
 
     print(f"\n{'=' * 60}")
     print(f"BIFURCATION THRESHOLD: {threshold} nS")
@@ -199,11 +210,15 @@ def _generate_figures(results, threshold):
     power = [r['oscillation_power'] for r in results]
     ci = [r['CI'] for r in results]
     osc = [1 if r['oscillating'] else 0 for r in results]
+    pause_rate = [r['pause_rate_hz'] for r in results]
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
 
-    axes[0].plot(gaba, power, 'ko-', markersize=4)
-    axes[0].set_ylabel('Oscillation Power (7-14 Hz)')
+    # Panel 1: Pause rate (primary bifurcation metric)
+    axes[0].plot(gaba, pause_rate, 'ko-', markersize=5, linewidth=1.5)
+    axes[0].set_ylabel('Pause Rate (Hz)')
+    axes[0].axhline(1.0, color='gray', linestyle=':', linewidth=1,
+                    label='Oscillation threshold (1 Hz)')
     axes[0].axvline(29.0, color='red', linestyle='--', linewidth=1.5,
                     label='Le Masson = 29 nS')
     if threshold is not None:
@@ -213,18 +228,31 @@ def _generate_figures(results, threshold):
     axes[0].set_title('Bifurcation Diagram — Le Masson 2002 Replication')
     axes[0].grid(True, alpha=0.3)
 
-    colors = ['green' if o else 'gray' for o in osc]
-    axes[1].bar(gaba, osc, color=colors, width=1.5)
-    axes[1].set_ylabel('Oscillating?')
+    # Panel 2: Oscillation power
+    axes[1].plot(gaba, power, 'ko-', markersize=4)
+    axes[1].set_ylabel('Oscillation Power\n(7-14 Hz band)')
     axes[1].axvline(29.0, color='red', linestyle='--')
-    if threshold:
+    if threshold is not None:
         axes[1].axvline(threshold, color='blue', linestyle='--')
+    axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(gaba, ci, 'bo-', markersize=4)
-    axes[2].set_ylabel('Contribution Index (CI)')
-    axes[2].set_xlabel('GABA G_max (nS)')
+    # Panel 3: Binary oscillation
+    colors = ['green' if o else 'gray' for o in osc]
+    axes[2].bar(gaba, osc, color=colors, width=1.5)
+    axes[2].set_ylabel('Oscillating?')
     axes[2].axvline(29.0, color='red', linestyle='--')
+    if threshold:
+        axes[2].axvline(threshold, color='blue', linestyle='--')
     axes[2].grid(True, alpha=0.3)
+
+    # Panel 4: Contribution Index
+    axes[3].plot(gaba, ci, 'bo-', markersize=4)
+    axes[3].set_ylabel('Contribution Index (CI)')
+    axes[3].set_xlabel('GABA G_max (nS)')
+    axes[3].axvline(29.0, color='red', linestyle='--')
+    if threshold is not None:
+        axes[3].axvline(threshold, color='blue', linestyle='--')
+    axes[3].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(figures_dir, 'bifurcation_parallel.png'),
