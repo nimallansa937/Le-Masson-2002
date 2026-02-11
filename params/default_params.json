@@ -1,0 +1,96 @@
+{
+    "simulation": {
+        "dt": 0.025e-3,
+        "temperature_celsius": 35.0
+    },
+    "tc_neuron": {
+        "C_m": 1.0,
+        "g_Na": 90.0,
+        "g_K": 10.0,
+        "g_T": 2.2,
+        "g_h": 0.02,
+        "g_L": 0.01,
+        "g_KL": 0.03,
+        "E_Na": 50.0,
+        "E_K": -100.0,
+        "E_Ca": 120.0,
+        "E_h": -40.0,
+        "E_L": -70.0,
+        "E_KL": -100.0,
+        "V_rest": -64.0,
+        "area_cm2": 2.9e-4,
+        "_comment": "Conductances in mS/cm2. Based on Destexhe et al. 1996 J Neurophysiol 76:2049-2070"
+    },
+    "nrt_neuron": {
+        "C_m": 1.0,
+        "g_Na": 100.0,
+        "g_K": 10.0,
+        "g_Ts": 3.0,
+        "g_L": 0.05,
+        "E_Na": 50.0,
+        "E_K": -100.0,
+        "E_Ca": 120.0,
+        "E_L": -77.0,
+        "V_rest": -72.0,
+        "area_cm2": 1.43e-4,
+        "_comment": "Conductances in mS/cm2. Based on Destexhe et al. 1996"
+    },
+    "retinal_input": {
+        "default_rate_hz": 42.0,
+        "default_gamma_order": 1.5,
+        "physiological_rate_range": [5, 60],
+        "physiological_gamma_range": [0.7, 12]
+    },
+    "synapses": {
+        "ampa_ret_tc": {
+            "g_max_nS": 28.0,
+            "E_rev_mV": 0.0,
+            "alpha": 1.1,
+            "beta": 0.19,
+            "T_max_mM": 1.0,
+            "T_duration_ms": 1.0
+        },
+        "ampa_tc_nrt": {
+            "g_max_nS": 20.0,
+            "E_rev_mV": 0.0,
+            "alpha": 1.1,
+            "beta": 0.19,
+            "T_max_mM": 1.0,
+            "T_duration_ms": 1.0
+        },
+        "gabaa_nrt_tc": {
+            "g_max_nS": 35.0,
+            "E_rev_mV": -90.0,
+            "alpha": 5.0,
+            "beta": 0.18,
+            "T_max_mM": 1.0,
+            "T_duration_ms": 1.0
+        },
+        "gabab_nrt_tc": {
+            "g_max_nS": 1.4,
+            "E_rev_mV": -110.0,
+            "K1": 0.09,
+            "K2": 0.0012,
+            "K3": 0.18,
+            "K4": 0.034,
+            "n": 4,
+            "Kd": 100.0,
+            "T_max_mM": 1.0,
+            "T_duration_ms": 1.0
+        }
+    },
+    "gabaa_gabab_ratio": {
+        "gabaa_fraction": 0.96,
+        "gabab_fraction": 0.04,
+        "_comment": "96:4 ratio optimized from n=18 cells (Le Masson 2002 Methods)"
+    },
+    "experimental_targets": {
+        "oscillation_threshold_nS": {"mean": 29.0, "sd": 4.2, "n": 9},
+        "spindle_frequency_Hz": {"mean": 9.26, "sd": 0.87, "n": 27},
+        "spindle_duration_s": {"mean": 1.74, "sd": 0.36, "n": 27},
+        "tc_input_resistance_MOhm": {"mean": 68.1, "sd": 3.1, "n": 19},
+        "tc_ap_threshold_mV": {"mean": -44.4, "sd": 0.6, "n": 11},
+        "tc_spike_latency_control_ms": {"mean": 5.3, "sd": 1.3},
+        "tc_spike_latency_NA_ms": {"mean": 2.8, "sd": 0.3}
+    }
+}
