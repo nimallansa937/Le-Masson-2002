@@ -17,7 +17,7 @@ import argparse
 import time
 import json
 import numpy as np
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,11 +29,24 @@ from population.population_metrics import (
 from analysis.oscillation import find_bifurcation_threshold
 
 
+_counter = None
+_total = None
+
+
+def _init_worker(counter, total):
+    global _counter, _total
+    _counter = counter
+    _total = total
+
+
 def run_single_trial(args):
-    """Run one (gaba, fraction, seed) trial. For multiprocessing.Pool.map()."""
+    """Run one (gaba, fraction, seed) trial. For multiprocessing.Pool."""
+    global _counter, _total
     (gaba_gmax, fraction, replacement_seed, n_tc, n_nrt,
      duration_s, retinal_rate, gamma_order, dt, network_seed,
      hetero_seed, input_seed, strategy) = args
+
+    t_start = time.time()
 
     circuit = PopulationCircuit(
         n_tc=n_tc, n_nrt=n_nrt,
@@ -76,6 +89,17 @@ def run_single_trial(args):
     # nRt firing rates
     nrt_rates = [len(s) / duration_s for s in sim['nrt_spike_times']]
     mean_nrt_rate = float(np.mean(nrt_rates))
+
+    # Progress
+    elapsed_trial = time.time() - t_start
+    if _counter is not None:
+        with _counter.get_lock():
+            _counter.value += 1
+            done = _counter.value
+        tot = _total.value if _total is not None else '?'
+        print(f"[{done}/{tot}] frac={fraction:.2f} GABA={gaba_gmax:.0f} "
+              f"PR={mean_pr:.2f} Coh={coherence:.3f} ({elapsed_trial:.0f}s)",
+              flush=True)
 
     return {
         'gaba_gmax': float(gaba_gmax),
@@ -175,7 +199,13 @@ def main():
 
     t0 = time.time()
 
-    with Pool(processes=n_workers) as pool:
+    mgr = Manager()
+    counter = mgr.Value('i', 0)
+    total = mgr.Value('i', total_trials)
+
+    with Pool(processes=n_workers,
+              initializer=_init_worker,
+              initargs=(counter, total)) as pool:
         results = pool.map(run_single_trial, task_args)
 
     elapsed = time.time() - t0
