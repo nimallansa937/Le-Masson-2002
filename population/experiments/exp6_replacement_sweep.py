@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
-from population.population_circuit import PopulationCircuit
+from population.population_circuit_fast import PopulationCircuit
 from population.population_metrics import (
     population_spindle_coherence, population_pause_rate,
     population_burst_fraction, participation_fraction,

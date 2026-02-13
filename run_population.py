@@ -21,7 +21,7 @@ from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from population.population_circuit import PopulationCircuit
+from population.population_circuit_fast import PopulationCircuit
 from population.population_metrics import (
     population_spindle_coherence, spindle_frequency_stability,
     participation_fraction, population_pause_rate, population_burst_fraction,
