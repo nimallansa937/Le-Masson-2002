@@ -23,13 +23,9 @@ Vast.ai workflow:
     6. Any instance:  --phase compare
 """
 
-import sys
-import os
 import time
 import json
 import argparse
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rung3.config import (
     DATA_DIR, CHECKPOINT_DIR, FIGURE_DIR,

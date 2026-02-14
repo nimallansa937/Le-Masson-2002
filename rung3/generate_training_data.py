@@ -10,14 +10,11 @@ Each trial saves V_tc, V_nrt, spike times, and biological intermediates
 (gating variables, summed synaptic conductances) for Rung 3 model comparison.
 """
 
-import sys
 import os
 import time
 import argparse
 import numpy as np
 from multiprocessing import Pool
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from population.population_circuit_fast import PopulationCircuit
 from rung3.config import (

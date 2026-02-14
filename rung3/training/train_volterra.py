@@ -4,14 +4,10 @@ Volterra-Laguerre training script.
 Fits the GLVM via ridge regression (CPU only, no iterative training).
 """
 
-import sys
 import os
 import time
 import json
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))))
 
 from rung3.config import (
     DATA_DIR, CHECKPOINT_DIR, TRAIN_SEEDS, VAL_SEEDS,
