@@ -437,9 +437,13 @@ class GABABArray:
         self.s += ds * dt_ms
         np.maximum(self.s, 0.0, out=self.s)
 
-    def current_matrix(self, V_post):
+    def conductance(self):
+        """Return effective conductance array (M,)."""
         s_n = self.s ** self.n
-        g_eff = self.g_max * s_n / (s_n + self.Kd)
+        return self.g_max * s_n / (s_n + self.Kd)
+
+    def current_matrix(self, V_post):
+        g_eff = self.conductance()
         return -g_eff * (V_post - self.E_rev)
 
 
@@ -561,8 +565,31 @@ class PopulationCircuit:
 
         self.input_seed = input_seed
 
-    def simulate(self, duration_s, record_dt=None):
-        """Run vectorized simulation."""
+    def simulate(self, duration_s, record_dt=None, record_intermediates=False):
+        """Run vectorized simulation.
+
+        Parameters
+        ----------
+        duration_s : float
+            Simulation duration in seconds.
+        record_dt : float, optional
+            Recording timestep (default 1ms).
+        record_intermediates : bool
+            If True, record gating variables and per-neuron summed synaptic
+            conductances at each record step. Adds ~6x memory but provides
+            biological ground truth for Rung 3 latent comparison.
+
+        Returns
+        -------
+        result : dict
+            Standard keys: t, V_tc, V_nrt, tc_spike_times, nrt_spike_times, etc.
+            If record_intermediates=True, also includes 'intermediates' dict with:
+              tc_m_T, tc_h_T, tc_m_h (n_tc, n_timepoints)
+              nrt_m_Ts, nrt_h_Ts (n_nrt, n_timepoints)
+              gabaa_per_tc (n_tc, n_timepoints) — summed GABA_A conductance
+              gabab_per_tc (n_tc, n_timepoints) — summed GABA_B conductance
+              ampa_per_nrt (n_nrt, n_timepoints) — summed AMPA conductance
+        """
         dt = self.dt
         n_steps = int(duration_s / dt)
         dt_ms = dt * 1000.0
@@ -579,6 +606,17 @@ class PopulationCircuit:
         V_tc_rec = np.zeros((n_tc, n_record))
         V_nrt_rec = np.zeros((n_nrt, n_record))
         rec_idx = 0
+
+        # Intermediate recording arrays
+        if record_intermediates:
+            tc_mT_rec = np.zeros((n_tc, n_record))
+            tc_hT_rec = np.zeros((n_tc, n_record))
+            tc_mh_rec = np.zeros((n_tc, n_record))
+            nrt_mTs_rec = np.zeros((n_nrt, n_record))
+            nrt_hTs_rec = np.zeros((n_nrt, n_record))
+            gabaa_tc_rec = np.zeros((n_tc, n_record))
+            gabab_tc_rec = np.zeros((n_tc, n_record))
+            ampa_nrt_rec = np.zeros((n_nrt, n_record))
 
         # Retinal inputs
         input_rng = np.random.default_rng(self.input_seed)
@@ -686,6 +724,35 @@ class PopulationCircuit:
                 t_rec[rec_idx] = t
                 V_tc_rec[:, rec_idx] = self.tc.V
                 V_nrt_rec[:, rec_idx] = self.nrt.V
+
+                if record_intermediates:
+                    # TC gating variables
+                    tc_mT_rec[:, rec_idx] = self.tc.m_T
+                    tc_hT_rec[:, rec_idx] = self.tc.h_T
+                    tc_mh_rec[:, rec_idx] = self.tc.m_h
+                    # nRt gating variables
+                    nrt_mTs_rec[:, rec_idx] = self.nrt.m_Ts
+                    nrt_hTs_rec[:, rec_idx] = self.nrt.h_Ts
+                    # Per-neuron summed synaptic conductances
+                    # GABA_A onto TC: sum per-synapse conductances per TC neuron
+                    ga_cond = np.zeros(n_tc)
+                    if len(self.nt_post) > 0:
+                        syn_ga = self.gabaa_nrt_tc.conductance()
+                        np.add.at(ga_cond, self.nt_post, syn_ga)
+                    gabaa_tc_rec[:, rec_idx] = ga_cond
+                    # GABA_B onto TC
+                    gb_cond = np.zeros(n_tc)
+                    if len(self.nt_post) > 0:
+                        syn_gb = self.gabab_nrt_tc.conductance()
+                        np.add.at(gb_cond, self.nt_post, syn_gb)
+                    gabab_tc_rec[:, rec_idx] = gb_cond
+                    # AMPA onto nRt: sum per-synapse conductances per nRt neuron
+                    ampa_cond = np.zeros(n_nrt)
+                    if len(self.tn_post) > 0:
+                        syn_ampa = self.ampa_tc_nrt.conductance()
+                        np.add.at(ampa_cond, self.tn_post, syn_ampa)
+                    ampa_nrt_rec[:, rec_idx] = ampa_cond
+
                 rec_idx += 1
 
             # Advance ring buffer
@@ -695,7 +762,7 @@ class PopulationCircuit:
         V_tc_rec = V_tc_rec[:, :rec_idx]
         V_nrt_rec = V_nrt_rec[:, :rec_idx]
 
-        return {
+        result = {
             't': t_rec,
             'V_tc': V_tc_rec,
             'V_nrt': V_nrt_rec,
@@ -708,3 +775,17 @@ class PopulationCircuit:
             'replacement_indices': self.replacement_indices,
             'is_replacement': self.is_replacement,
         }
+
+        if record_intermediates:
+            result['intermediates'] = {
+                'tc_m_T': tc_mT_rec[:, :rec_idx],
+                'tc_h_T': tc_hT_rec[:, :rec_idx],
+                'tc_m_h': tc_mh_rec[:, :rec_idx],
+                'nrt_m_Ts': nrt_mTs_rec[:, :rec_idx],
+                'nrt_h_Ts': nrt_hTs_rec[:, :rec_idx],
+                'gabaa_per_tc': gabaa_tc_rec[:, :rec_idx],
+                'gabab_per_tc': gabab_tc_rec[:, :rec_idx],
+                'ampa_per_nrt': ampa_nrt_rec[:, :rec_idx],
+            }
+
+        return result
