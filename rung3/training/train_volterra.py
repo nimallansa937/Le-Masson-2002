@@ -40,10 +40,10 @@ def train_volterra(data_dir=DATA_DIR, checkpoint_dir=CHECKPOINT_DIR,
 
     if verbose:
         print(f"Volterra-Laguerre Model")
-        print(f"  Bases: {VOLTERRA_N_BASES}, α={VOLTERRA_ALPHA}")
+        print(f"  Bases: {VOLTERRA_N_BASES}, alpha={VOLTERRA_ALPHA}")
         print(f"  Memory: {VOLTERRA_MEMORY_MS}ms, Order: {VOLTERRA_ORDER}")
         print(f"  Features: {model.n_features}")
-        print(f"  Ridge α: {VOLTERRA_RIDGE_ALPHA}")
+        print(f"  Ridge alpha: {VOLTERRA_RIDGE_ALPHA}")
 
     # Load training data
     all_trials = list_trials(data_dir)

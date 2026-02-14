@@ -23,6 +23,8 @@ Vast.ai workflow:
     6. Any instance:  --phase compare
 """
 
+import sys
+import os
 import time
 import json
 import argparse

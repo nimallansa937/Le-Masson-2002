@@ -10,6 +10,7 @@ Each trial saves V_tc, V_nrt, spike times, and biological intermediates
 (gating variables, summed synaptic conductances) for Rung 3 model comparison.
 """
 
+import sys
 import os
 import time
 import argparse
@@ -115,7 +116,7 @@ def main():
                           idx, total))
             idx += 1
 
-    print(f"Generating {total} trials ({len(gaba_vals)} GABA × {len(seeds)} seeds)")
+    print(f"Generating {total} trials ({len(gaba_vals)} GABA x {len(seeds)} seeds)")
     print(f"Duration: {args.duration}s per trial | Workers: {args.workers}")
     print(f"Output: {args.data_dir}/")
     print(f"{'='*60}")
