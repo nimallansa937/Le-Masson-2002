@@ -59,7 +59,7 @@ VOLTERRA_N_BASES = 12        # Number of Laguerre basis functions
 VOLTERRA_ALPHA = 0.85        # Laguerre parameter (memory decay)
 VOLTERRA_MEMORY_MS = 200     # Memory depth in ms
 VOLTERRA_ORDER = 2           # Max nonlinear order (diagonal 2nd order)
-VOLTERRA_RIDGE_ALPHA = 1.0   # Ridge regularization
+VOLTERRA_RIDGE_ALPHA = 100.0  # Ridge regularization (high for 625-feature space)
 VOLTERRA_OUTPUT_FEEDBACK = True  # Include output feedback
 VOLTERRA_FB_N_BASES = 6      # Feedback Laguerre bases (fewer than forward)
 
@@ -130,6 +130,8 @@ BIF_TARGET_SD = 4.2          # Target 1 SD
 CCA_N_PERMUTATIONS = 1000    # Permutation test iterations
 CCA_BLOCK_SIZE = 100         # Block bootstrap size (for autocorrelation)
 CCA_MAX_COMPONENTS = 20      # Max CCA components to compute
+CCA_PCA_COMPONENTS = 30      # PCA reduction before CCA (standard in neuro CCA)
+CCA_MAX_ITER = 1000          # sklearn CCA NIPALS iterations (default 500 too low)
 
 # RSA
 RSA_N_TIMEPOINTS = 500       # Subsample timepoints for RSA (memory)

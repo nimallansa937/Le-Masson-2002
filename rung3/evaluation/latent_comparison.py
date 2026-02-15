@@ -28,6 +28,7 @@ from scipy.spatial.distance import pdist, squareform
 
 try:
     from sklearn.cross_decomposition import CCA as SklearnCCA
+    from sklearn.decomposition import PCA
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import cross_val_score
     HAS_SKLEARN = True
@@ -36,6 +37,7 @@ except ImportError:
 
 from rung3.config import (
     CCA_N_PERMUTATIONS, CCA_BLOCK_SIZE, CCA_MAX_COMPONENTS,
+    CCA_PCA_COMPONENTS, CCA_MAX_ITER,
     RSA_N_TIMEPOINTS, RSA_DISTANCE_METRIC,
     VAR_RECOVERY_ALPHA, VAR_RECOVERY_CV, VAR_RECOVERY_BONFERRONI,
 )
@@ -76,7 +78,7 @@ def compute_cca(model_latent, bio_intermediate, n_components=None):
         n_components = min(min(d_model, d_bio) // 2, CCA_MAX_COMPONENTS)
     n_components = max(1, min(n_components, min(d_model, d_bio)))
 
-    cca = SklearnCCA(n_components=n_components)
+    cca = SklearnCCA(n_components=n_components, max_iter=CCA_MAX_ITER)
     X_c, Y_c = cca.fit_transform(model_latent, bio_intermediate)
 
     # Canonical correlations
@@ -117,6 +119,24 @@ def cca_permutation_test(model_latent, bio_intermediate,
     rng = np.random.default_rng(seed)
     n_t = model_latent.shape[0]
 
+    # PCA dimensionality reduction — standard preprocessing for high-dim CCA
+    # Reduces computation from O(d^3) to O(k^3) per CCA fit
+    d_model = model_latent.shape[1]
+    d_bio = bio_intermediate.shape[1]
+    n_pca = CCA_PCA_COMPONENTS
+
+    if d_model > n_pca:
+        pca_model = PCA(n_components=n_pca)
+        model_latent = pca_model.fit_transform(model_latent)
+        print(f"     PCA: model {d_model} -> {n_pca} dims "
+              f"({pca_model.explained_variance_ratio_.sum():.1%} var)")
+
+    if d_bio > n_pca:
+        pca_bio = PCA(n_components=n_pca)
+        bio_intermediate = pca_bio.fit_transform(bio_intermediate)
+        print(f"     PCA: bio {d_bio} -> {n_pca} dims "
+              f"({pca_bio.explained_variance_ratio_.sum():.1%} var)")
+
     # Observed CCA
     observed = compute_cca(model_latent, bio_intermediate)
 
@@ -140,6 +160,9 @@ def cca_permutation_test(model_latent, bio_intermediate,
             null_corrs.append(null_result['mean_corr'])
         except Exception:
             null_corrs.append(0.0)
+
+        if (perm + 1) % 100 == 0:
+            print(f"     Permutation {perm + 1}/{n_permutations}...")
 
     null_corrs = np.array(null_corrs)
     p_value = float(np.mean(null_corrs >= observed['mean_corr']))
