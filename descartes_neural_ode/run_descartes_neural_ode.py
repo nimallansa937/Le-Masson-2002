@@ -57,10 +57,14 @@ def main():
 
         train_data['X_train'] = train_data['X_train'][train_idx]
         train_data['Y_train'] = train_data['Y_train'][train_idx]
+        if 'Y_binary_train' in train_data:
+            train_data['Y_binary_train'] = train_data['Y_binary_train'][train_idx]
         train_data['X_short'] = train_data['X_train'][:, :200, :]
         train_data['Y_short'] = train_data['Y_train'][:, :200, :]
         val_data['X_val'] = val_data['X_val'][val_idx]
         val_data['Y_val'] = val_data['Y_val'][val_idx]
+        if 'Y_binary_val' in val_data:
+            val_data['Y_binary_val'] = val_data['Y_binary_val'][val_idx]
 
         print(f"\nSubsampled: {n_sub_train} train, {n_sub_val} val windows")
 
