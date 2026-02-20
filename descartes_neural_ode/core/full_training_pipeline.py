@@ -164,11 +164,17 @@ class FullTrainingPipeline:
                 optimizer.step()
                 epoch_losses.append(loss.item())
 
-            # --- Validation ---
+            # --- Validation (batched to avoid OOM) ---
             model.eval()
             with torch.no_grad():
-                val_output = model(self.X_val)
-                val_pred = val_output[0] if isinstance(val_output, tuple) else val_output
+                val_preds = []
+                n_val = self.X_val.shape[0]
+                for vi in range(0, n_val, batch_size):
+                    vx = self.X_val[vi:vi + batch_size]
+                    vo = model(vx)
+                    vp = vo[0] if isinstance(vo, tuple) else vo
+                    val_preds.append(vp)
+                val_pred = torch.cat(val_preds, dim=0)
                 val_loss = self._compute_loss(
                     val_pred, self.Y_val, self.Yb_val, bce_loss, mse_loss
                 ).item()
@@ -198,12 +204,18 @@ class FullTrainingPipeline:
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # Compute final metrics on rate targets
+        # Compute final metrics on rate targets (batched to avoid OOM)
         model.eval()
         with torch.no_grad():
-            val_output = model(self.X_val)
-            val_pred = val_output[0] if isinstance(val_output, tuple) else val_output
-            val_np = val_pred.cpu().numpy()
+            val_preds_final = []
+            n_val = self.X_val.shape[0]
+            for vi in range(0, n_val, batch_size):
+                vx = self.X_val[vi:vi + batch_size]
+                vo = model(vx)
+                vp = vo[0] if isinstance(vo, tuple) else vo
+                val_preds_final.append(vp.cpu())
+            val_pred = torch.cat(val_preds_final, dim=0)
+            val_np = val_pred.numpy()
             val_true = self.Y_val.cpu().numpy()
 
         # Spike correlation (on smoothed rates)
