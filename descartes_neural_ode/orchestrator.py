@@ -37,6 +37,14 @@ from core.biovar_pattern_extractor import BioVarPatternExtractor
 from core.full_training_pipeline import FullTrainingPipeline
 from core.memory import MemoryLayer, MemoryEntry
 
+# LLM integration (optional)
+try:
+    from core.llm_architect import LLMArchitect, IterationRecord, LLMSuggestion
+    from core.dreamcoder_history import DreamCoderHistory
+    LLM_AVAILABLE = True
+except ImportError:
+    LLM_AVAILABLE = False
+
 
 @dataclass
 class DescartesPipelineResult:
@@ -67,7 +75,10 @@ class DescartesNeuralODEOrchestrator:
         bio_ground_truth: Dict,     # Ground truth bio variables
         device: str = 'cuda',
         max_training_hours: float = 2.0,
-        verbose: bool = True
+        verbose: bool = True,
+        use_llm: bool = False,
+        api_key: str = None,
+        max_llm_expansions: int = 10
     ):
         # Data
         self.train_data = train_data
@@ -94,6 +105,36 @@ class DescartesNeuralODEOrchestrator:
         self.balloon_expansions = 0
         self.iteration_log = []
 
+        # LLM integration
+        self.use_llm = use_llm and LLM_AVAILABLE
+        self.max_llm_expansions = max_llm_expansions
+
+        if self.use_llm:
+            self.llm_architect = LLMArchitect(api_key=api_key)
+
+            # Build category and timescale index maps for DreamCoderHistory
+            bio_var_names = [v.name for v in self.registry]
+            bio_var_categories = {}
+            bio_var_timescales = {}
+            for v in self.registry:
+                bio_var_categories.setdefault(v.category, []).append(v.id)
+                bio_var_timescales.setdefault(v.timescale, []).append(v.id)
+
+            self.dreamcoder_history = DreamCoderHistory(
+                bio_var_names=bio_var_names,
+                bio_var_categories=bio_var_categories,
+                bio_var_timescales=bio_var_timescales
+            )
+
+            if self.verbose:
+                print(f"  LLM-guided search ENABLED (max {max_llm_expansions} expansions)")
+        else:
+            self.llm_architect = None
+            self.dreamcoder_history = None
+            if use_llm and not LLM_AVAILABLE:
+                print("  WARNING: --use-llm requested but anthropic package not installed")
+                print("  Install with: pip install anthropic")
+
     def run(
         self,
         max_iterations: int = 20,
@@ -115,6 +156,8 @@ class DescartesNeuralODEOrchestrator:
             print(f"Target: {target_recovery}/160 bio vars, spike corr >= {target_spike_corr}")
             print(f"Templates: {len(self.templates)}")
             print(f"Budget: {max_iterations} iterations, {self.max_hours}h per training")
+            if self.use_llm:
+                print(f"LLM-guided: YES (max {self.max_llm_expansions} expansions)")
             print()
 
         best_arch = None
@@ -136,17 +179,27 @@ class DescartesNeuralODEOrchestrator:
                 if self.verbose:
                     print("\nALL TEMPLATES EXHAUSTED — BALLOON EXPANSION")
 
-                # DreamCoder sleep phase
-                patterns = self.dreamcoder.sleep_phase_analyze()
-                library = self.dreamcoder.compress_library()
+                new_templates = []
 
-                if self.verbose:
-                    print(f"  Patterns discovered: {len(patterns)}")
-                    for p in patterns:
-                        print(f"    - [{p.pattern_type}] {p.description[:80]}...")
+                # Try LLM-guided expansion first (if enabled)
+                if self.use_llm and self.llm_architect and self.llm_architect.available:
+                    gap = self.recovery_space.compute_gap()
+                    new_templates = self._balloon_expand_llm(gap)
 
-                # Generate new templates from patterns
-                new_templates = self._balloon_expand(patterns, library)
+                # Fall back to hardcoded expansion if LLM not available or failed
+                if not new_templates:
+                    # DreamCoder sleep phase
+                    patterns = self.dreamcoder.sleep_phase_analyze()
+                    library = self.dreamcoder.compress_library()
+
+                    if self.verbose:
+                        print(f"  Patterns discovered: {len(patterns)}")
+                        for p in patterns:
+                            print(f"    - [{p.pattern_type}] {p.description[:80]}...")
+
+                    # Generate new templates from patterns
+                    new_templates = self._balloon_expand(patterns, library)
+
                 if not new_templates:
                     if self.verbose:
                         print("  Cannot expand further. Stopping.")
@@ -192,6 +245,11 @@ class DescartesNeuralODEOrchestrator:
                     failed_early=True,
                     failure_reason=verify_result.failure_reason
                 )
+                self._record_for_llm(
+                    template, None, None, verify_result,
+                    failed=True,
+                    failure_reason=f"verify_failed: {verify_result.failure_reason}"
+                )
                 self._record_iteration(iteration, template, verify_result, None,
                                        f"verify_failed: {verify_result.failure_reason}")
                 continue
@@ -228,6 +286,9 @@ class DescartesNeuralODEOrchestrator:
                 template, recovery, spike_corr, bif_error,
                 train_result.training_hours
             )
+
+            # -------- RECORD FOR LLM (if enabled) --------
+            self._record_for_llm(template, recovery, train_result, verify_result)
 
             # -------- RECORD IN MEMORY --------
             self.memory.record(MemoryEntry(
@@ -290,6 +351,14 @@ class DescartesNeuralODEOrchestrator:
 
         # Final DreamCoder analysis
         final_patterns = self.dreamcoder.sleep_phase_analyze()
+
+        # Final LLM DreamCoder analysis (if enabled)
+        if self.use_llm and self.dreamcoder_history:
+            llm_patterns = self.dreamcoder_history.extract_patterns()
+            if self.verbose and llm_patterns:
+                print(f"\nFinal DreamCoder-LLM patterns ({len(llm_patterns)}):")
+                for p in llm_patterns[:5]:
+                    print(f"  [{p['type']}] {p['description'][:80]}...")
 
         return DescartesPipelineResult(
             best_architecture=best_arch or "none",
@@ -451,6 +520,170 @@ class DescartesNeuralODEOrchestrator:
             t.vector = t.to_property_vector()
 
         return new_templates
+
+    # ================================================================
+    # LLM INTEGRATION METHODS
+    # ================================================================
+
+    def _record_for_llm(self, template, recovery, train_result=None,
+                        verify_result=None, failed=False, failure_reason=None):
+        """Record iteration results for LLM architect and DreamCoder history."""
+        if not self.use_llm:
+            return
+
+        # Build IterationRecord for LLM history
+        record = IterationRecord(
+            iteration=len(self.llm_architect.history) + 1,
+            template_name=template.name,
+            family=template.family,
+            time_handling=template.time_handling.value,
+            gradient_strategy=template.gradient_strategy.value,
+            latent_structure=template.latent_structure.value,
+            input_coupling=template.input_coupling.value,
+            solver=template.solver.value,
+            spike_correlation=train_result.spike_correlation if train_result else 0.0,
+            bio_vars_recovered=recovery.n_recovered if recovery else 0,
+            recovery_by_category=recovery.recovered_by_category if recovery else {},
+            near_misses=[],  # populated below if available
+            cca_score=recovery.cca_score if recovery else None,
+            epochs_completed=getattr(train_result, 'epochs_completed', 0) if train_result else 0,
+            final_train_loss=getattr(train_result, 'final_train_loss', None) if train_result else None,
+            final_val_loss=getattr(train_result, 'final_val_loss', None) if train_result else None,
+            training_time_hours=train_result.training_hours if train_result else None,
+            short_segment_corr=(verify_result.spike_correlation_50step
+                                if verify_result and hasattr(verify_result, 'spike_correlation_50step')
+                                else None),
+            failed=failed,
+            failure_reason=failure_reason
+        )
+
+        # Extract near-miss variable names (0.3 < r < 0.5)
+        if recovery and hasattr(recovery, 'correlation_vector'):
+            near_miss_idx = np.where(
+                (recovery.correlation_vector > 0.3) &
+                (recovery.correlation_vector < 0.5)
+            )[0]
+            record.near_misses = [self.registry[i].name for i in near_miss_idx[:15]]
+
+        self.llm_architect.record_iteration(record)
+
+        # Record in DreamCoder history (needs recovery + correlation vectors)
+        if recovery and hasattr(recovery, 'recovery_vector') and hasattr(recovery, 'correlation_vector'):
+            self.dreamcoder_history.add_result(
+                name=template.name,
+                config={
+                    'time_handling': template.time_handling.value,
+                    'gradient_strategy': template.gradient_strategy.value,
+                    'latent_structure': template.latent_structure.value,
+                    'input_coupling': template.input_coupling.value,
+                    'solver': template.solver.value
+                },
+                recovery_vector=recovery.recovery_vector,
+                correlation_vector=recovery.correlation_vector
+            )
+
+    def _balloon_expand_llm(self, gap) -> List[ArchitectureTemplate]:
+        """
+        LLM-powered balloon expansion.
+
+        Uses DreamCoder patterns + full history to ask the LLM for
+        a new architecture template targeting the specific gap.
+        """
+        if self.llm_architect.balloon_count >= self.max_llm_expansions:
+            if self.verbose:
+                print(f"  Max LLM expansions ({self.max_llm_expansions}) reached")
+            return []
+
+        # Run DreamCoder sleep phase on accumulated history
+        dc_patterns = self.dreamcoder_history.extract_patterns()
+        self.llm_architect.record_patterns(dc_patterns)
+
+        if self.verbose:
+            print(f"  DreamCoder extracted {len(dc_patterns)} patterns:")
+            for p in dc_patterns[:5]:
+                print(f"    [{p['type']}] {p['description'][:80]}...")
+
+        # Record exhausted families
+        for fam in self.exhausted_families:
+            self.llm_architect.record_exhausted_family(fam)
+
+        # Format gap for LLM
+        gap_dict = {
+            'remaining_gap': getattr(gap, 'residual_magnitude', 1.0),
+            'direction': getattr(gap, 'gap_direction', 'unknown'),
+            'profile': getattr(gap, 'gap_profile', {}),
+        }
+        if hasattr(gap, 'timescale_profile'):
+            gap_dict['timescale_profile'] = gap.timescale_profile
+        if hasattr(gap, 'dynamics_profile'):
+            gap_dict['dynamics_profile'] = gap.dynamics_profile
+
+        # Ask LLM for suggestion
+        if self.verbose:
+            print(f"  Calling LLM for architecture suggestion...")
+
+        suggestion = self.llm_architect.suggest_architecture(gap_dict)
+
+        if suggestion is None:
+            if self.verbose:
+                print(f"  LLM suggestion failed, falling back to hardcoded expansion")
+            return []
+
+        # Convert LLM suggestion to ArchitectureTemplate
+        template = self._suggestion_to_template(suggestion)
+
+        if self.verbose:
+            print(f"  LLM BALLOON EXPANSION #{self.llm_architect.balloon_count}")
+            print(f"    Name: {suggestion.name}")
+            print(f"    Reasoning: {suggestion.reasoning}")
+            print(f"    Config: time={suggestion.time_handling}, "
+                  f"gradient={suggestion.gradient_strategy}, "
+                  f"latent={suggestion.latent_structure}")
+            if suggestion.custom_notes:
+                print(f"    Notes: {suggestion.custom_notes}")
+
+        return [template]
+
+    def _suggestion_to_template(self, suggestion: 'LLMSuggestion') -> ArchitectureTemplate:
+        """Convert LLM suggestion to ArchitectureTemplate."""
+
+        def safe_enum(enum_class, value, default):
+            """Map string value to enum, with fallback."""
+            try:
+                return enum_class(value)
+            except (ValueError, KeyError):
+                if self.verbose:
+                    print(f"    Warning: Unknown {enum_class.__name__} "
+                          f"value '{value}', using {default}")
+                return default
+
+        balloon_id = self.llm_architect.balloon_count
+
+        template = ArchitectureTemplate(
+            id=f"llm_{balloon_id}_{suggestion.name[:30]}",
+            name=f"LLM-{balloon_id}: {suggestion.name}",
+            description=suggestion.reasoning,
+            family=f"llm_generated_{balloon_id}",
+            time_handling=safe_enum(
+                TimeHandling, suggestion.time_handling, TimeHandling.LTC),
+            gradient_strategy=safe_enum(
+                GradientStrategy, suggestion.gradient_strategy, GradientStrategy.SEGMENTED),
+            latent_structure=safe_enum(
+                LatentStructure, suggestion.latent_structure, LatentStructure.UNCONSTRAINED),
+            input_coupling=safe_enum(
+                InputCoupling, suggestion.input_coupling, InputCoupling.ADDITIVE),
+            solver=safe_enum(
+                SolverChoice, suggestion.solver, SolverChoice.EULER),
+            latent_dim_range=(suggestion.latent_dim, suggestion.latent_dim * 4),
+            complexity=4,
+            expected_training_hours=2.0
+        )
+        template.vector = template.to_property_vector()
+        return template
+
+    # ================================================================
+    # LOGGING
+    # ================================================================
 
     def _record_iteration(self, iteration, template, verify_result,
                           recovery, status):
