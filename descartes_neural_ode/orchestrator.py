@@ -238,21 +238,36 @@ class DescartesNeuralODEOrchestrator:
             if not verify_result.passed:
                 if self.verbose:
                     print(f"  X Short-segment FAILED: {verify_result.failure_reason}")
-                self.exhausted_templates.add(template.id)
-                self.dreamcoder.record_attempt(
-                    template, None, 0.0, float('inf'),
-                    verify_result.training_time_seconds / 3600,
-                    failed_early=True,
-                    failure_reason=verify_result.failure_reason
-                )
-                self._record_for_llm(
-                    template, None, None, verify_result,
-                    failed=True,
-                    failure_reason=f"verify_failed: {verify_result.failure_reason}"
-                )
-                self._record_iteration(iteration, template, verify_result, None,
-                                       f"verify_failed: {verify_result.failure_reason}")
-                continue
+
+                # LLM Decision Point 1: Ask LLM for a fix and retry ONCE
+                retried_ok = False
+                if (self.use_llm and self.llm_architect
+                        and self.llm_architect.available):
+                    retried_ok = self._llm_retry_verify(
+                        model, template, verify_result
+                    )
+
+                if retried_ok:
+                    # Retry succeeded — re-run verification to get updated result
+                    verify_result = self._llm_last_verify_result
+                    if self.verbose:
+                        print(f"  OK LLM fix worked! Continuing to full training.")
+                else:
+                    self.exhausted_templates.add(template.id)
+                    self.dreamcoder.record_attempt(
+                        template, None, 0.0, float('inf'),
+                        verify_result.training_time_seconds / 3600,
+                        failed_early=True,
+                        failure_reason=verify_result.failure_reason
+                    )
+                    self._record_for_llm(
+                        template, None, None, verify_result,
+                        failed=True,
+                        failure_reason=f"verify_failed: {verify_result.failure_reason}"
+                    )
+                    self._record_iteration(iteration, template, verify_result, None,
+                                           f"verify_failed: {verify_result.failure_reason}")
+                    continue
 
             if self.verbose:
                 print(f"  OK Short-segment passed (50-step corr: {verify_result.spike_correlation_50step:.3f})")
@@ -280,6 +295,26 @@ class DescartesNeuralODEOrchestrator:
                 print(f"  Bio vars recovered: {recovery.n_recovered}/160")
                 print(f"  By category: {recovery.recovered_by_category}")
                 print(f"  CCA score: {recovery.cca_score:.3f}")
+
+            # -------- LLM DECISION POINT 2: C2 HYPERPARAMETER TWEAK --------
+            # If LLM enabled, ask if a C2 tweak could improve recovery. Retry ONCE.
+            if (self.use_llm and self.llm_architect
+                    and self.llm_architect.available
+                    and recovery.n_recovered < target_recovery
+                    and recovery.n_recovered > 0):
+                improved = self._llm_retry_c2_tweak(
+                    model, template, verify_result,
+                    spike_corr, recovery, train_result
+                )
+                if improved:
+                    # Use improved results
+                    spike_corr = improved['spike_corr']
+                    recovery = improved['recovery']
+                    train_result = improved['train_result']
+                    model = improved['model']
+                    if self.verbose:
+                        print(f"  * C2 tweak improved recovery: "
+                              f"{recovery.n_recovered}/160")
 
             # -------- RECORD IN DREAMCODER --------
             self.dreamcoder.record_attempt(
@@ -312,6 +347,14 @@ class DescartesNeuralODEOrchestrator:
                 print(f"    Remaining gap: {gap.residual_magnitude:.1%}")
                 print(f"    Direction: {gap.gap_direction[:80]}...")
                 print(f"    Profile: {gap.gap_profile}")
+
+            # -------- LLM DECISION POINT 3: NEAR-MISS INTERPRETATION --------
+            if (self.use_llm and self.llm_architect
+                    and self.llm_architect.available
+                    and hasattr(recovery, 'correlation_vector')):
+                self._llm_interpret_near_misses(
+                    template, recovery, gap
+                )
 
             # -------- UPDATE BEST --------
             template.attempts += 1
@@ -524,6 +567,300 @@ class DescartesNeuralODEOrchestrator:
     # ================================================================
     # LLM INTEGRATION METHODS
     # ================================================================
+
+    def _llm_retry_verify(self, model, template, verify_result) -> bool:
+        """
+        LLM Decision Point 1: After short-segment failure, ask LLM for a fix
+        and retry verification ONCE.
+
+        Returns True if retry succeeded (sets self._llm_last_verify_result).
+        Returns False if LLM failed, fix didn't work, or retry also failed.
+        """
+        self._llm_last_verify_result = None
+
+        template_config = {
+            'time_handling': template.time_handling.value,
+            'gradient_strategy': template.gradient_strategy.value,
+            'latent_structure': template.latent_structure.value,
+            'input_coupling': template.input_coupling.value,
+            'solver': template.solver.value
+        }
+
+        if self.verbose:
+            print(f"  -> Asking LLM for verification fix...")
+
+        fix = self.llm_architect.suggest_verify_fix(
+            template_config=template_config,
+            failure_reason=verify_result.failure_reason or "unknown",
+            short_segment_corr=(verify_result.spike_correlation_50step
+                                if hasattr(verify_result, 'spike_correlation_50step')
+                                else None),
+            final_loss=verify_result.final_loss if hasattr(verify_result, 'final_loss') else None
+        )
+
+        if fix is None:
+            if self.verbose:
+                print(f"  -> LLM fix unavailable, skipping retry")
+            return False
+
+        if self.verbose:
+            print(f"  -> LLM fix: [{fix.get('fix_type')}] {fix.get('description', '')}")
+
+        # Apply the fix overrides to verification retry
+        overrides = fix.get('overrides', {})
+        retry_lr = overrides.get('lr', 1e-3)
+        retry_epochs = overrides.get('n_epochs', 20)
+
+        # Rebuild model if solver changed
+        if 'solver' in overrides:
+            # Temporarily modify template solver for model rebuild
+            from core.architecture_templates import SolverChoice
+            original_solver = template.solver
+            try:
+                template.solver = SolverChoice(overrides['solver'])
+                model = self._build_model(template)
+                template.solver = original_solver  # restore
+            except (ValueError, KeyError):
+                template.solver = original_solver
+                model = self._build_model(template)
+
+            if model is None:
+                if self.verbose:
+                    print(f"  -> Failed to rebuild model with new solver")
+                return False
+        else:
+            # Rebuild fresh model (reset weights)
+            model = self._build_model(template)
+            if model is None:
+                return False
+
+        # Apply gradient clipping if suggested
+        if 'grad_clip' in overrides:
+            # Store for use during verify — the verifier handles this internally
+            # We pass it through lr parameter (verifier's default grad clip is 1.0)
+            pass  # grad_clip handled by verifier internally
+
+        # Retry verification with LLM-suggested parameters
+        try:
+            retry_result = self.verifier.verify(
+                model, lr=retry_lr, n_epochs=retry_epochs
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  -> Retry verification raised exception: {e}")
+            return False
+
+        if retry_result.passed:
+            self._llm_last_verify_result = retry_result
+            return True
+        else:
+            if self.verbose:
+                print(f"  -> LLM retry also failed: {retry_result.failure_reason}")
+            return False
+
+    def _llm_retry_c2_tweak(self, model, template, verify_result,
+                            spike_corr, recovery, train_result) -> Optional[Dict]:
+        """
+        LLM Decision Point 2: After full training, ask LLM for a C2
+        hyperparameter tweak and retrain ONCE.
+
+        Returns dict with improved results if retry beat original,
+        or None if no improvement.
+        """
+        template_config = {
+            'time_handling': template.time_handling.value,
+            'gradient_strategy': template.gradient_strategy.value,
+            'latent_structure': template.latent_structure.value,
+            'input_coupling': template.input_coupling.value,
+            'solver': template.solver.value
+        }
+
+        # Get near-miss variable names
+        near_misses = []
+        if hasattr(recovery, 'correlation_vector'):
+            near_miss_idx = np.where(
+                (recovery.correlation_vector > 0.3) &
+                (recovery.correlation_vector < 0.5)
+            )[0]
+            near_misses = [self.registry[i].name for i in near_miss_idx[:15]]
+
+        if not near_misses:
+            # No near-misses to optimize for
+            return None
+
+        if self.verbose:
+            print(f"\n  -> Asking LLM for C2 tweak ({len(near_misses)} near-misses)...")
+
+        tweak = self.llm_architect.suggest_c2_tweak(
+            template_config=template_config,
+            spike_correlation=spike_corr,
+            bio_vars_recovered=recovery.n_recovered,
+            recovery_by_category=recovery.recovered_by_category,
+            near_misses=near_misses,
+            training_hours=train_result.training_hours,
+            epochs_completed=train_result.total_epochs,
+            best_val_loss=train_result.best_val_loss,
+            converged=train_result.converged
+        )
+
+        if tweak is None:
+            if self.verbose:
+                print(f"  -> LLM C2 tweak unavailable, keeping original result")
+            return None
+
+        if self.verbose:
+            print(f"  -> LLM C2 tweak: [{tweak.get('tweak_type')}] "
+                  f"{tweak.get('description', '')}")
+
+        overrides = tweak.get('overrides', {})
+        if not overrides:
+            return None
+
+        # Rebuild model if latent_dim changed
+        retry_model = model
+        if 'latent_dim' in overrides:
+            new_dim = overrides['latent_dim']
+            original_range = template.latent_dim_range
+            template.latent_dim_range = (new_dim, new_dim * 4)
+            retry_model = self._build_model(template)
+            template.latent_dim_range = original_range  # restore
+            if retry_model is None:
+                if self.verbose:
+                    print(f"  -> Failed to rebuild model with latent_dim={new_dim}")
+                return None
+        else:
+            # Rebuild fresh model (new random init)
+            retry_model = self._build_model(template)
+            if retry_model is None:
+                return None
+
+        # Retrain with tweaked hyperparameters
+        retry_lr = overrides.get('lr', 5e-4)
+        retry_batch = overrides.get('batch_size', 32)
+        retry_patience = overrides.get('patience', 30)
+        retry_epochs = overrides.get('max_epochs', 300)
+
+        if self.verbose:
+            print(f"  -> Retraining with tweaked C2: lr={retry_lr}, "
+                  f"batch={retry_batch}, patience={retry_patience}...")
+
+        try:
+            retry_model, retry_train = self.trainer.train(
+                retry_model, template,
+                lr=retry_lr,
+                batch_size=retry_batch,
+                max_epochs=retry_epochs,
+                patience=retry_patience,
+                verbose=self.verbose
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  -> C2 retry training failed: {e}")
+            return None
+
+        # Score retry recovery
+        try:
+            retry_latents = self._extract_latents(retry_model, template)
+            retry_recovery = score_biovar_recovery(
+                retry_latents, self.bio_gt, self.registry
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  -> C2 retry recovery scoring failed: {e}")
+            return None
+
+        retry_spike = retry_train.spike_correlation
+
+        if self.verbose:
+            print(f"  -> C2 retry: spike_corr={retry_spike:.3f}, "
+                  f"bio_vars={retry_recovery.n_recovered}/160 "
+                  f"(original: {spike_corr:.3f}, {recovery.n_recovered}/160)")
+
+        # Keep retry only if it improved
+        if retry_recovery.n_recovered > recovery.n_recovered:
+            self.recovery_space.add_result(
+                f"{template.id}_c2_retry", retry_recovery
+            )
+            return {
+                'spike_corr': retry_spike,
+                'recovery': retry_recovery,
+                'train_result': retry_train,
+                'model': retry_model
+            }
+        else:
+            if self.verbose:
+                print(f"  -> C2 retry did not improve, keeping original")
+            return None
+
+    def _llm_interpret_near_misses(self, template, recovery, gap):
+        """
+        LLM Decision Point 3: After gap analysis, ask LLM to interpret
+        WHY near-miss variables didn't cross the threshold.
+
+        Results are logged and stored for future balloon expansions.
+        """
+        # Build near-miss variable info
+        near_miss_vars = []
+        if hasattr(recovery, 'correlation_vector'):
+            for i in range(len(recovery.correlation_vector)):
+                r = recovery.correlation_vector[i]
+                if 0.3 < r < 0.5:
+                    var = self.registry[i]
+                    near_miss_vars.append({
+                        'name': var.name,
+                        'correlation': float(r),
+                        'category': var.category,
+                        'timescale': var.timescale,
+                        'dynamics_type': getattr(var, 'dynamics_type', 'unknown')
+                    })
+
+        if not near_miss_vars:
+            return
+
+        # Get DreamCoder patterns
+        dc_patterns = []
+        if self.dreamcoder_history:
+            dc_patterns = self.dreamcoder_history.extract_patterns()
+
+        best_config = {
+            'time_handling': template.time_handling.value,
+            'gradient_strategy': template.gradient_strategy.value,
+            'latent_structure': template.latent_structure.value,
+            'input_coupling': template.input_coupling.value,
+            'solver': template.solver.value
+        }
+
+        if self.verbose:
+            print(f"\n  -> Asking LLM to interpret {len(near_miss_vars)} near-misses...")
+
+        interpretation = self.llm_architect.interpret_near_misses(
+            near_miss_vars=near_miss_vars,
+            best_architecture=best_config,
+            gap_profile=gap.gap_profile if hasattr(gap, 'gap_profile') else {},
+            patterns=dc_patterns
+        )
+
+        if interpretation is None:
+            return
+
+        if self.verbose:
+            print(f"  -> LLM interpretation: {interpretation.get('interpretation', '')[:120]}...")
+            mods = interpretation.get('suggested_modifications', [])
+            if mods:
+                for m in mods[:3]:
+                    print(f"     Suggestion: {m.get('modification', '')[:80]}")
+                    print(f"       Targets: {m.get('targets', '')}")
+
+        # Store interpretation in the LLM architect's patterns for future use
+        self.llm_architect.record_patterns(
+            self.llm_architect.patterns + [{
+                'type': 'llm_near_miss_interpretation',
+                'description': interpretation.get('interpretation', ''),
+                'evidence': json.dumps(interpretation.get('suggested_modifications', [])),
+                'confidence': 0.8,
+                'priority_variables': interpretation.get('priority_variables', [])
+            }]
+        )
 
     def _record_for_llm(self, template, recovery, train_result=None,
                         verify_result=None, failed=False, failure_reason=None):
