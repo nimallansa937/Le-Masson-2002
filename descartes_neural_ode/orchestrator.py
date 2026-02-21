@@ -296,6 +296,21 @@ class DescartesNeuralODEOrchestrator:
                 print(f"  By category: {recovery.recovered_by_category}")
                 print(f"  CCA score: {recovery.cca_score:.3f}")
 
+                # Diagnostic: show top 5 correlations and 5 lowest
+                corr = recovery.correlation_vector
+                top5_idx = np.argsort(corr)[-5:][::-1]
+                print(f"  Top 5 correlations:")
+                for idx in top5_idx:
+                    print(f"    {self.registry[idx].name}: r={corr[idx]:.4f}")
+                bot5_idx = np.argsort(corr)[:5]
+                print(f"  Bottom 5 correlations:")
+                for idx in bot5_idx:
+                    print(f"    {self.registry[idx].name}: r={corr[idx]:.4f}")
+                n_nonzero = np.sum(corr > 0.01)
+                n_near_miss = np.sum((corr > 0.3) & (corr < 0.5))
+                print(f"  Non-zero correlations: {n_nonzero}/160, "
+                      f"Near-miss (0.3-0.5): {n_near_miss}")
+
             # -------- LLM DECISION POINT 2: C2 HYPERPARAMETER TWEAK --------
             # If LLM enabled, ask if a C2 tweak could improve recovery. Retry ONCE.
             if (self.use_llm and self.llm_architect
@@ -463,27 +478,57 @@ class DescartesNeuralODEOrchestrator:
         """
         model.eval()
         with torch.no_grad():
-            x_val = torch.tensor(
-                self.val_data['X_val'][:1] if isinstance(self.val_data['X_val'], np.ndarray)
-                else self.val_data['X_val'][:1].cpu().numpy(),
-                device=self.device, dtype=torch.float32
-            )
+            # Use first validation window
+            x_val_np = (self.val_data['X_val'][:1]
+                        if isinstance(self.val_data['X_val'], np.ndarray)
+                        else self.val_data['X_val'][:1].cpu().numpy())
+            x_val = torch.tensor(x_val_np, device=self.device, dtype=torch.float32)
+
             output = model(x_val)
 
             if isinstance(output, tuple) and len(output) >= 2:
-                # (predictions, latents)
                 latents = output[1]
                 if isinstance(latents, torch.Tensor):
-                    latents = latents.cpu().numpy()
+                    latents_np = latents.cpu().numpy()
                     # Shape: (1, T, latent_dim) -> (latent_dim, T)
-                    return latents[0].T
+                    result = latents_np[0].T
                 elif isinstance(latents, dict) and 'hidden' in latents:
-                    return latents['hidden'][0].T if isinstance(latents['hidden'], np.ndarray) else latents['hidden'][0].cpu().numpy().T
+                    h = latents['hidden']
+                    result = (h[0].T if isinstance(h, np.ndarray)
+                              else h[0].cpu().numpy().T)
+                else:
+                    print(f"  [latent] WARNING: Unexpected latent type: {type(latents)}")
+                    result = None
+            elif isinstance(output, torch.Tensor):
+                # Model only returned predictions, no latents
+                print(f"  [latent] WARNING: Model returned only predictions "
+                      f"(shape {output.shape}), no latent states")
+                result = None
+            else:
+                print(f"  [latent] WARNING: Unexpected output type: {type(output)}")
+                result = None
 
-        # Fallback: random placeholder
+        if result is not None:
+            # Diagnostics
+            if self.verbose:
+                print(f"  [latent] Extracted shape: {result.shape}")
+                print(f"  [latent] Stats: mean={result.mean():.4f}, "
+                      f"std={result.std():.4f}, "
+                      f"min={result.min():.4f}, max={result.max():.4f}")
+                # Check for constant/degenerate states
+                per_dim_std = np.std(result, axis=1)
+                n_constant = np.sum(per_dim_std < 1e-6)
+                if n_constant > 0:
+                    print(f"  [latent] WARNING: {n_constant}/{result.shape[0]} "
+                          f"latent dims are near-constant (std < 1e-6)")
+            return result
+
+        # FAIL LOUD instead of silent random fallback
         latent_dim = template.latent_dim_range[0]
         T = self.val_data.get('T', 2000)
-        return np.random.randn(latent_dim, T)
+        print(f"  [latent] ERROR: Could not extract latents! "
+              f"Using zeros ({latent_dim}, {T}) — bio recovery will be 0/160")
+        return np.zeros((latent_dim, T))
 
     def _balloon_expand(self, patterns, library) -> List[ArchitectureTemplate]:
         """

@@ -46,46 +46,59 @@ def build_biovar_registry() -> List[BiologicalVariable]:
 
     These correspond to the ground truth intermediates recorded
     in A-R2 Phase 0 (transformation_replacement_guide.md, Phase 0).
+
+    IMPORTANT: Variable names use the EXACT keys from the HDF5 data loader:
+      tc_m_T, tc_h_T, tc_m_h    (TC gating, stored in bio_gt as (20, T))
+      V_nrt, nrt_m_Ts, nrt_h_Ts (nRt state, stored in bio_gt as (20, T))
+      gabaa_per_tc, gabab_per_tc (synaptic, stored in bio_gt as (20, T))
+
+    Each variable is named as "{gt_key}_{neuron_index}" so that
+    _align_and_stack can split on the LAST underscore to recover the
+    ground truth key and neuron index.
     """
     registry = []
     idx = 0
 
     # TC gating variables (60 total)
+    # gt_key -> (subcategory, timescale, dynamics_type)
+    tc_gating_vars = [
+        ("tc_m_T", "mT", "fast", "switching"),      # T-current activation: fast, binary-like
+        ("tc_h_T", "hT", "slow", "oscillatory"),     # T-current inactivation: slow, oscillates in spindles
+        ("tc_m_h", "mH", "slow", "monotonic"),       # H-current: slow, monotonic ramp
+    ]
     for neuron in range(20):
-        for var, subcat, ts, dyn in [
-            ("tc_mT", "mT", "fast", "switching"),      # T-current activation: fast, binary-like
-            ("tc_hT", "hT", "slow", "oscillatory"),     # T-current inactivation: slow, oscillates in spindles
-            ("tc_mH", "mH", "slow", "monotonic"),       # H-current: slow, monotonic ramp
-        ]:
+        for gt_key, subcat, ts, dyn in tc_gating_vars:
             registry.append(BiologicalVariable(
-                id=idx, name=f"{var}_{neuron}",
+                id=idx, name=f"{gt_key}:{neuron}",
                 category="tc_gating", subcategory=subcat,
                 neuron_index=neuron, timescale=ts, dynamics_type=dyn
             ))
             idx += 1
 
     # nRt state variables (60 total)
+    nrt_state_vars = [
+        ("V_nrt", "V", "fast", "oscillatory"),       # nRt voltage: fast, oscillatory
+        ("nrt_m_Ts", "mT", "fast", "switching"),     # nRt T-current activation
+        ("nrt_h_Ts", "hT", "slow", "oscillatory"),   # nRt T-current inactivation
+    ]
     for neuron in range(20):
-        for var, subcat, ts, dyn in [
-            ("nrt_V", "V", "fast", "oscillatory"),       # nRt voltage: fast, oscillatory
-            ("nrt_mT", "mT", "fast", "switching"),       # nRt T-current activation
-            ("nrt_hT", "hT", "slow", "oscillatory"),     # nRt T-current inactivation
-        ]:
+        for gt_key, subcat, ts, dyn in nrt_state_vars:
             registry.append(BiologicalVariable(
-                id=idx, name=f"{var}_{neuron}",
+                id=idx, name=f"{gt_key}:{neuron}",
                 category="nrt_state", subcategory=subcat,
                 neuron_index=neuron, timescale=ts, dynamics_type=dyn
             ))
             idx += 1
 
     # Synaptic conductances (40 total)
+    synaptic_vars = [
+        ("gabaa_per_tc", "gaba_a", "fast", "switching"),   # GABA_A: fast inhibition
+        ("gabab_per_tc", "gaba_b", "slow", "monotonic"),   # GABA_B: slow inhibition
+    ]
     for synapse in range(20):
-        for var, subcat, ts, dyn in [
-            ("gaba_a", "gaba_a", "fast", "switching"),   # GABA_A: fast inhibition
-            ("gaba_b", "gaba_b", "slow", "monotonic"),   # GABA_B: slow inhibition
-        ]:
+        for gt_key, subcat, ts, dyn in synaptic_vars:
             registry.append(BiologicalVariable(
-                id=idx, name=f"{var}_{synapse}",
+                id=idx, name=f"{gt_key}:{synapse}",
                 category="synaptic", subcategory=subcat,
                 neuron_index=synapse, timescale=ts, dynamics_type=dyn
             ))
@@ -140,11 +153,29 @@ def score_biovar_recovery(
     correlation_vector = np.zeros(n_bio)
     best_mapping = {}
 
+    # Pre-check: skip bio variables that are constant (zero-variance)
+    bio_std = np.std(bio_matrix, axis=1)
+    latent_std = np.std(model_latents, axis=1)
+    n_const_bio = np.sum(bio_std < 1e-10)
+    n_const_latent = np.sum(latent_std < 1e-10)
+    if n_const_bio > 0:
+        print(f"  [biovar] WARNING: {n_const_bio}/160 bio variables are constant "
+              f"(not matched to ground truth)")
+    if n_const_latent > 0:
+        print(f"  [biovar] WARNING: {n_const_latent}/{n_latent} latent dims are constant")
+
     for i in range(n_bio):
+        if bio_std[i] < 1e-10:
+            # Bio variable not matched to ground truth — skip
+            continue
         best_r = 0.0
         best_j = -1
         for j in range(n_latent):
+            if latent_std[j] < 1e-10:
+                continue  # Skip constant latent dims
             r, _ = pearsonr(bio_matrix[i], model_latents[j])
+            if np.isnan(r):
+                continue
             if abs(r) > abs(best_r):
                 best_r = r
                 best_j = j
@@ -296,19 +327,46 @@ class BioVarRecoverySpace:
 
 
 def _align_and_stack(bio_gt, registry, target_T):
-    """Align biological ground truth to model temporal resolution."""
+    """
+    Align biological ground truth to model temporal resolution.
+
+    Registry names use format "gt_key:neuron_idx" (e.g., "tc_m_T:5").
+    The gt_key maps directly to bio_gt dict keys.
+    """
+    from scipy.interpolate import interp1d
+
     bio_matrix = np.zeros((len(registry), target_T))
+    matched = 0
+    unmatched_keys = set()
+
     for var in registry:
-        parts = var.name.rsplit('_', 1)
-        var_name = parts[0]
-        neuron_idx = int(parts[1])
-        if var_name in bio_gt:
-            raw = bio_gt[var_name][neuron_idx]
+        # Split on ':' separator — gt_key:neuron_idx
+        if ':' in var.name:
+            gt_key, neuron_str = var.name.rsplit(':', 1)
+            neuron_idx = int(neuron_str)
+        else:
+            # Legacy fallback: split on last underscore
+            parts = var.name.rsplit('_', 1)
+            gt_key = parts[0]
+            neuron_idx = int(parts[1])
+
+        if gt_key in bio_gt:
+            raw = bio_gt[gt_key][neuron_idx]
             # Resample to target_T
-            from scipy.interpolate import interp1d
             x_old = np.linspace(0, 1, len(raw))
             x_new = np.linspace(0, 1, target_T)
             bio_matrix[var.id] = interp1d(x_old, raw, kind='linear')(x_new)
+            matched += 1
+        else:
+            unmatched_keys.add(gt_key)
+
+    if unmatched_keys:
+        print(f"  [biovar] WARNING: {len(unmatched_keys)} GT keys not found: "
+              f"{sorted(unmatched_keys)[:5]}")
+        print(f"  [biovar] Available GT keys: {sorted(bio_gt.keys())[:10]}...")
+    print(f"  [biovar] Matched {matched}/160 variables to ground truth "
+          f"(target_T={target_T})")
+
     return bio_matrix
 
 
