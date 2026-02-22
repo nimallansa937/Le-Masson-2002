@@ -1,30 +1,46 @@
 """
-Extended data loader that provides biological variable targets
-aligned to training windows for the A-R3b experiment.
+Bio-aligned data loader for A-R3b: GRU-ODE with Auxiliary Biological Loss.
 
-In A-R3, bio variables were only used post-hoc for evaluation.
-In A-R3b, they are provided AS TRAINING TARGETS alongside spike data.
+CRITICAL DESIGN: Each training window gets bio targets from its OWN
+source trial at its OWN temporal offset. This ensures perfect alignment
+between spike data and biological variable targets.
 
-Design choice: bio targets are drawn from the canonical trial's
-biological variables and shared across all windows. This is a valid
-simplification because:
-  1. We're testing whether the model CAN encode biology, not whether
-     it can track per-trial variability
-  2. The canonical bio represents the same biological system
-  3. Each window covers 2s of the same 10s simulation
-  4. Different windows see different 2s segments (aligned by offset)
+Previous version (BUGGY): Used canonical trial's bio variables for ALL
+windows, regardless of which GABA level or seed produced the spikes.
+This meant windows from trial_gaba74_seed43 got bio targets from
+trial_gaba30_seed42 — completely wrong dynamics.
 
-Normalization: each variable is z-scored (zero mean, unit variance)
-so that MSE loss weights all variables equally regardless of their
-natural scale (voltages ~50mV, gating ~0.5, conductances ~10nS).
+Architecture:
+  1. Reuse load_ar2_data() for spike data (unchanged, well-tested)
+  2. Re-scan the same trial HDF5 files to load intermediates per-trial
+  3. Build a window-to-trial mapping (trial_idx, temporal_offset)
+  4. Normalize bio variables globally across all training trials
+  5. In __getitem__, slice the correct trial at the correct offset
+
+Memory efficiency: stores per-trial category arrays (~730 MB for 114
+training trials) rather than pre-windowed bio data (~2.5 GB), and
+slices on-the-fly in __getitem__.
 """
 import numpy as np
+import h5py
+import re
 import torch
+from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
+
+# Import constants from existing data loader (must match exactly for
+# window alignment — same bin size, window size, stride, seed splits)
+from .ar3_data_loader import (
+    load_ar2_data,
+    BIN_DT_MS, WINDOW_SIZE_MS, WINDOW_STRIDE_MS,
+    TRAIN_SEEDS, VAL_SEEDS,
+)
 
 
-# Variable-to-category mapping (matches DESCARTES 160-dim recovery space)
+# ── Variable organization ────────────────────────────────────────────
+
+# Variable-to-category mapping (DESCARTES 160-dim recovery space)
 VAR_TO_CATEGORY = {
     'tc_m_T': 'tc_gating',
     'tc_h_T': 'tc_gating',
@@ -36,124 +52,253 @@ VAR_TO_CATEGORY = {
     'gabab_per_tc': 'synaptic',
 }
 
-# Expected dimensions per category
+# Ordered variable names per category (order matters for consistent
+# concatenation across trials — must be the same everywhere)
+CATEGORY_VARS = {
+    'tc_gating': ['tc_m_T', 'tc_h_T', 'tc_m_h'],        # 3 × 20 = 60 vars
+    'nrt_state': ['nrt_m_Ts', 'nrt_h_Ts', 'V_nrt'],      # 3 × 20 = 60 vars
+    'synaptic': ['gabaa_per_tc', 'gabab_per_tc'],          # 2 × 20 = 40 vars
+}
+
 EXPECTED_DIMS = {
-    'tc_gating': 60,   # 3 vars x 20 neurons
-    'nrt_state': 60,   # 3 vars x 20 neurons
-    'synaptic': 40,    # 2 vars x 20 neurons
+    'tc_gating': 60,
+    'nrt_state': 60,
+    'synaptic': 40,
 }
 
 
+# ── Trial parsing ────────────────────────────────────────────────────
+
+def _parse_trials(data_dir):
+    """Parse trial HDF5 filenames into structured list.
+
+    Must produce the EXACT same ordering as ar3_data_loader.load_ar2_data()
+    to ensure window indices match between spike and bio data. Both use
+    sorted(glob('trial_gaba*.h5')) and filter by seed.
+    """
+    data_path = Path(data_dir)
+    h5_files = sorted(data_path.glob('trial_gaba*.h5'))
+
+    trials = []
+    for f in h5_files:
+        match = re.match(r'trial_gaba([\d.]+)_seed(\d+)\.h5', f.name)
+        if match:
+            trials.append({
+                'filepath': f,
+                'gaba': float(match.group(1)),
+                'seed': int(match.group(2)),
+            })
+    return trials
+
+
+# ── Per-trial intermediate loading ───────────────────────────────────
+
+def _load_trial_intermediates(filepath):
+    """Load the 8 biological intermediate variables from one HDF5 trial.
+
+    Returns dict of var_name -> (n_neurons, T) numpy array.
+    Handles V_nrt being at top level (not in intermediates/ group).
+    """
+    intermediates = {}
+    with h5py.File(filepath, 'r') as f:
+        for var_name in VAR_TO_CATEGORY.keys():
+            if var_name == 'V_nrt':
+                # V_nrt is stored at top level, not in intermediates/
+                if 'V_nrt' in f:
+                    intermediates['V_nrt'] = f['V_nrt'][:].astype(np.float32)
+            else:
+                key = f'intermediates/{var_name}'
+                if key in f:
+                    intermediates[var_name] = f[key][:].astype(np.float32)
+    return intermediates
+
+
+def _organize_into_categories(intermediates):
+    """Organize per-trial intermediates into category arrays.
+
+    Args:
+        intermediates: dict of var_name -> (n_neurons, T) arrays
+
+    Returns:
+        categories: dict of cat_name -> (T, n_vars) arrays
+            e.g., 'tc_gating' -> (10000, 60) for 3 vars × 20 neurons
+    """
+    categories = {}
+
+    for cat_name, var_names in CATEGORY_VARS.items():
+        arrays = []
+        for var_name in var_names:
+            if var_name in intermediates:
+                # (n_neurons, T) → (T, n_neurons) for temporal-first layout
+                arrays.append(intermediates[var_name].T)
+
+        if arrays:
+            # Concatenate along var axis: (T, 20) + (T, 20) + ... = (T, n_vars)
+            categories[cat_name] = np.concatenate(arrays, axis=1)
+
+    return categories
+
+
+def _load_all_trial_categories(trials):
+    """Load intermediates for all trials and organize into categories.
+
+    Returns list of dicts, one per trial, each dict: cat_name -> (T, n_vars).
+    """
+    all_cats = []
+    for i, trial_info in enumerate(trials):
+        intermediates = _load_trial_intermediates(trial_info['filepath'])
+        categories = _organize_into_categories(intermediates)
+        all_cats.append(categories)
+
+        if (i + 1) % 20 == 0:
+            print(f"    Bio loaded {i + 1}/{len(trials)} trials")
+
+    return all_cats
+
+
+# ── Normalization ────────────────────────────────────────────────────
+
+def _compute_global_normalization(trial_cats):
+    """Compute z-score parameters per variable across ALL training trials.
+
+    Global normalization ensures consistent z-scores across trials,
+    regardless of GABA level. This is critical because:
+      - Voltages range ~50mV, gating vars ~0-1, conductances ~0-10 nS
+      - MSE loss needs all variables on the same scale
+      - Per-trial normalization would break cross-trial comparisons
+
+    Uses Welford-style accumulation (sum + sum_of_squares) for numerical
+    stability with large datasets.
+    """
+    cat_sums = {}
+    cat_sq_sums = {}
+    cat_counts = {}
+
+    for trial_cat in trial_cats:
+        for cat_name, data in trial_cat.items():
+            n_vars = data.shape[1]
+            if cat_name not in cat_sums:
+                cat_sums[cat_name] = np.zeros(n_vars, dtype=np.float64)
+                cat_sq_sums[cat_name] = np.zeros(n_vars, dtype=np.float64)
+                cat_counts[cat_name] = 0
+
+            cat_sums[cat_name] += data.sum(axis=0).astype(np.float64)
+            cat_sq_sums[cat_name] += (data.astype(np.float64) ** 2).sum(axis=0)
+            cat_counts[cat_name] += data.shape[0]
+
+    norm_params = {}
+    for cat_name in cat_sums:
+        n = cat_counts[cat_name]
+        mean = (cat_sums[cat_name] / n).astype(np.float32)
+        variance = (cat_sq_sums[cat_name] / n
+                     - mean.astype(np.float64) ** 2).astype(np.float32)
+        std = np.sqrt(np.maximum(variance, 0)).astype(np.float32)
+        std[std < 1e-8] = 1.0  # Prevent division by zero
+
+        norm_params[cat_name] = {'mean': mean, 'std': std}
+        print(f"  [bio_loader] {cat_name}: {len(mean)} vars, "
+              f"mean=[{mean.min():.3f}, {mean.max():.3f}], "
+              f"std=[{std.min():.4f}, {std.max():.4f}]")
+
+    return norm_params
+
+
+def _normalize_trial_categories(trial_cats, norm_params):
+    """Apply z-score normalization to all trial categories in-place.
+
+    After this, each variable has approximately zero mean and unit
+    variance across the training set. Val data uses training statistics
+    (no data leakage).
+    """
+    for trial_cat in trial_cats:
+        for cat_name in list(trial_cat.keys()):
+            if cat_name in norm_params:
+                mean = norm_params[cat_name]['mean']   # (n_vars,)
+                std = norm_params[cat_name]['std']
+                trial_cat[cat_name] = ((trial_cat[cat_name] - mean) / std
+                                       ).astype(np.float32)
+
+
+# ── Window-to-trial mapping ─────────────────────────────────────────
+
+def _build_window_trial_map(trials):
+    """Build mapping from window index to (trial_idx, temporal_offset).
+
+    Uses the EXACT same windowing logic as ar3_data_loader._create_windows()
+    to ensure window indices align with the spike data (X_train/X_val).
+
+    Each 10s trial (10000 bins at 1ms) with window=2000, stride=500:
+      starts = [0, 500, 1000, ..., 8000] → 17 windows per trial.
+
+    The mapping is ordered: all windows from trial 0, then trial 1, etc.
+    This matches np.concatenate(X_list) in _process_trials().
+    """
+    window_bins = int(WINDOW_SIZE_MS / BIN_DT_MS)     # 2000
+    stride_bins = int(WINDOW_STRIDE_MS / BIN_DT_MS)   # 500
+
+    window_map = []
+
+    for trial_idx, trial_info in enumerate(trials):
+        # Read trial duration to compute correct window count
+        with h5py.File(trial_info['filepath'], 'r') as f:
+            duration_s = float(f['meta'].attrs['duration_s'])
+
+        T = int(duration_s * 1000.0 / BIN_DT_MS)  # Total bins
+        starts = list(range(0, T - window_bins + 1, stride_bins))
+
+        for start in starts:
+            window_map.append((trial_idx, start))
+
+    return window_map
+
+
+# ── Dataset ──────────────────────────────────────────────────────────
+
 class BioAlignedDataset(Dataset):
-    """
-    Dataset that provides (input_spikes, target_spikes, bio_targets) tuples.
+    """Dataset with per-window bio targets properly aligned per-trial.
 
-    bio_targets is a dict with keys 'tc_gating', 'nrt_state', 'synaptic',
-    each containing a tensor of shape (seq_len, n_vars_in_category).
+    Each window's bio targets come from its ACTUAL source trial at its
+    ACTUAL temporal offset — not from a shared canonical trial.
 
-    The bio targets are drawn from the canonical trial and aligned to the
-    training window's temporal position. All windows in a given epoch see
-    the SAME bio dynamics but at DIFFERENT time offsets (because they are
-    different 2s windows from a 10s simulation).
+    Memory-efficient: stores per-trial category arrays (not per-window)
+    and slices on-the-fly in __getitem__.
     """
 
-    def __init__(self, X, Y, Y_binary, bio_ground_truth, seq_len=2000,
-                 window_stride=500):
+    def __init__(self, X, Y, Y_binary, trial_categories, window_trial_map,
+                 seq_len=2000):
         """
         Args:
             X: (n_windows, seq_len, input_dim) — retinal spike inputs
             Y: (n_windows, seq_len, output_dim) — TC rate targets
             Y_binary: (n_windows, seq_len, output_dim) — TC binary spike targets
-            bio_ground_truth: dict from load_ar2_data(), keys like
-                'tc_m_T' -> (20, T_full) for canonical, or
-                'tc_m_T_gaba0' -> (20, T_full) for GABA-specific
-            seq_len: training window length (should match X.shape[1])
-            window_stride: stride used during windowing (for offset computation)
+            trial_categories: list of dicts per trial, each dict:
+                cat_name -> (T, n_vars) NORMALIZED numpy array
+            window_trial_map: list of (trial_idx, offset) tuples, one per window
+            seq_len: window length in bins (2000)
         """
         self.X = torch.FloatTensor(X) if not isinstance(X, torch.Tensor) else X
         self.Y = torch.FloatTensor(Y) if not isinstance(Y, torch.Tensor) else Y
-        self.Y_binary = torch.FloatTensor(Y_binary) if not isinstance(Y_binary, torch.Tensor) else Y_binary
+        self.Y_binary = (torch.FloatTensor(Y_binary) if not isinstance(Y_binary, torch.Tensor)
+                         else Y_binary)
+
+        self.trial_categories = trial_categories
+        self.window_trial_map = window_trial_map
         self.seq_len = seq_len
-        self.window_stride = window_stride
         self.n_windows = len(X)
 
-        # Build category tensors from bio ground truth
-        self.bio_categories, self.norm_params = self._organize_bio_vars(
-            bio_ground_truth
+        # Verify alignment
+        assert len(window_trial_map) == self.n_windows, (
+            f"Window count mismatch: spike data has {self.n_windows} windows "
+            f"but bio mapping has {len(window_trial_map)}. Trial ordering diverged!"
         )
-
-        # Compute window offsets for bio variable alignment
-        # Each window starts at window_idx * window_stride in the simulation
-        # Bio variables are at 1ms resolution (same as training data bins)
-        self.window_offsets = [i * window_stride for i in range(self.n_windows)]
-
-    def _organize_bio_vars(self, bio_gt):
-        """
-        Organize raw bio ground truth into category tensors with normalization.
-
-        Uses bare-name variables (canonical trial, no GABA suffix) when
-        available, falling back to the first available GABA-specific version.
-
-        Returns:
-            categories: dict of cat_name -> (T_full, n_vars) numpy array
-            norm_params: dict of cat_name -> (means, stds) for denormalization
-        """
-        # Collect arrays per category
-        cat_arrays = {
-            'tc_gating': [],
-            'nrt_state': [],
-            'synaptic': [],
-        }
-
-        for var_name, category in VAR_TO_CATEGORY.items():
-            # Prefer bare name (canonical), fall back to first GABA-specific
-            if var_name in bio_gt:
-                data = bio_gt[var_name]  # (20, T_full)
-            else:
-                # Try to find a GABA-specific version
-                found = False
-                for key in sorted(bio_gt.keys()):
-                    if key.startswith(var_name + '_gaba'):
-                        data = bio_gt[key]
-                        found = True
-                        break
-                if not found:
-                    print(f"  [bio_loader] WARNING: {var_name} not found in bio_gt, skipping")
-                    continue
-
-            # data shape: (20_neurons, T_full_timesteps)
-            # Transpose to (T_full, 20) for temporal-first layout
-            cat_arrays[category].append(data.T)
-
-        # Concatenate within categories and normalize
-        categories = {}
-        norm_params = {}
-
-        for cat_name, arrays in cat_arrays.items():
-            if not arrays:
-                print(f"  [bio_loader] WARNING: no variables found for {cat_name}")
-                continue
-
-            # Concatenate along variable axis: (T_full, n_vars)
-            cat_data = np.concatenate(arrays, axis=1).astype(np.float32)
-
-            # Z-score normalization per variable (critical for balanced MSE)
-            means = cat_data.mean(axis=0, keepdims=True)
-            stds = cat_data.std(axis=0, keepdims=True)
-            stds[stds < 1e-8] = 1.0  # Prevent division by zero
-
-            cat_normalized = (cat_data - means) / stds
-            categories[cat_name] = cat_normalized
-            norm_params[cat_name] = {'mean': means, 'std': stds}
-
-            print(f"  [bio_loader] {cat_name}: {cat_data.shape[1]} vars, "
-                  f"T={cat_data.shape[0]}, range=[{cat_data.min():.3f}, {cat_data.max():.3f}]")
-
-        return categories, norm_params
 
     def get_bio_dims(self):
         """Return dict of category -> n_variables for model construction."""
-        return {k: v.shape[1] for k, v in self.bio_categories.items()}
+        dims = {}
+        if self.trial_categories:
+            for cat_name, data in self.trial_categories[0].items():
+                dims[cat_name] = data.shape[1]
+        return dims
 
     def __len__(self):
         return self.n_windows
@@ -164,51 +309,26 @@ class BioAlignedDataset(Dataset):
             x: (seq_len, input_dim) — input spikes
             y: (seq_len, output_dim) — smoothed rate targets
             y_binary: (seq_len, output_dim) — binary spike targets
-            bio: dict of category_name -> (seq_len, n_vars) tensors
+            bio: dict of cat_name -> (seq_len, n_vars) tensors
         """
-        x = self.X[idx]
-        y = self.Y[idx]
-        y_bin = self.Y_binary[idx]
+        trial_idx, offset = self.window_trial_map[idx]
 
-        # Get bio targets aligned to this window's temporal position
-        offset = self.window_offsets[min(idx, len(self.window_offsets) - 1)]
         bio = {}
-
-        for cat_name, cat_data in self.bio_categories.items():
-            T_full = cat_data.shape[0]
-            start = offset
-            end = start + self.seq_len
-
-            if end <= T_full:
-                # Normal case: window fits within simulation
-                bio_slice = cat_data[start:end]
-            elif start < T_full:
-                # Window extends beyond simulation — pad with last value
-                available = cat_data[start:T_full]
-                pad_len = self.seq_len - available.shape[0]
-                pad = np.tile(available[-1:], (pad_len, 1))
-                bio_slice = np.vstack([available, pad])
-            else:
-                # Window is entirely beyond simulation — use last seq_len
-                bio_slice = cat_data[-self.seq_len:]
-
+        for cat_name, cat_data in self.trial_categories[trial_idx].items():
+            # Slice the exact temporal window from this trial's bio data
+            bio_slice = cat_data[offset:offset + self.seq_len]
             bio[cat_name] = torch.FloatTensor(bio_slice)
 
-        return x, y, y_bin, bio
+        return self.X[idx], self.Y[idx], self.Y_binary[idx], bio
 
+
+# ── Collate function ─────────────────────────────────────────────────
 
 def bio_collate_fn(batch):
-    """
-    Custom collate function for BioAlignedDataset.
+    """Custom collate for BioAlignedDataset batches.
 
-    Handles the dict-of-tensors in the bio targets by stacking
-    each category separately.
-
-    Returns:
-        x: (batch, seq_len, input_dim)
-        y: (batch, seq_len, output_dim)
-        y_binary: (batch, seq_len, output_dim)
-        bio: dict of category -> (batch, seq_len, n_vars)
+    Handles the dict-of-tensors bio targets by stacking each
+    category separately into (batch, seq_len, n_vars) tensors.
     """
     xs, ys, y_bins, bios = zip(*batch)
 
@@ -216,9 +336,8 @@ def bio_collate_fn(batch):
     y = torch.stack(ys, dim=0)
     y_bin = torch.stack(y_bins, dim=0)
 
-    # Collate bio dicts
     bio_collated = {}
-    if bios[0]:  # At least one category exists
+    if bios[0]:
         for cat_name in bios[0].keys():
             cat_tensors = [b[cat_name] for b in bios if cat_name in b]
             if cat_tensors:
@@ -227,39 +346,127 @@ def bio_collate_fn(batch):
     return x, y, y_bin, bio_collated
 
 
-def create_bio_dataloaders(train_data, val_data, bio_gt,
-                           batch_size=32, num_workers=0):
+# ── Main entry point ─────────────────────────────────────────────────
+
+def load_bio_aligned_data(data_dir, batch_size=32, num_workers=0):
     """
-    Create train and val DataLoaders with bio targets.
+    Load A-R2 data with per-window bio targets for A-R3b training.
+
+    This is the correct entry point for the A-R3b experiment. It:
+      1. Loads spike data via load_ar2_data() (unchanged, well-tested)
+      2. Re-scans trial HDF5 files to load biological intermediates
+      3. Builds per-window bio targets aligned to each window's source trial
+      4. Normalizes bio variables globally across training trials
+      5. Creates DataLoaders with (x, y, y_binary, bio_targets) batches
 
     Args:
-        train_data: dict from load_ar2_data() with X_train, Y_train, Y_binary_train
-        val_data: dict from load_ar2_data() with X_val, Y_val, Y_binary_val
-        bio_gt: dict from load_ar2_data() bio ground truth
+        data_dir: Path to directory containing trial_gaba*.h5 files
         batch_size: batch size for DataLoader
         num_workers: number of data loading workers
 
     Returns:
         train_loader: DataLoader yielding (x, y, y_binary, bio_targets)
-        val_loader: DataLoader yielding (x, y, y_binary, bio_targets)
+        val_loader: DataLoader for validation
         bio_dims: dict of category -> n_vars (for model construction)
+        bio_gt: dict of var_name -> (n_neurons, T) (for legacy evaluation)
+        data_info: dict with input_dim, output_dim, n_train, n_val
     """
+    # ── Step 1: Load spike data (reuses existing well-tested code) ──
+    print("\n  Loading spike data via load_ar2_data()...")
+    train_data, val_data, bio_gt = load_ar2_data(data_dir)
+
+    print(f"\n  Spike data loaded:")
+    print(f"    Train: X={train_data['X_train'].shape}, "
+          f"Y={train_data['Y_train'].shape}")
+    print(f"    Val:   X={val_data['X_val'].shape}, "
+          f"Y={val_data['Y_val'].shape}")
+
+    # ── Step 2: Re-scan trials for intermediates ──────────────────
+    trials = _parse_trials(data_dir)
+    if not trials:
+        raise ValueError(f"No trial_gaba*.h5 files found in {data_dir}")
+
+    train_trials = [t for t in trials if t['seed'] in TRAIN_SEEDS]
+    val_trials = [t for t in trials if t['seed'] in VAL_SEEDS]
+
+    print(f"\n  Loading biological intermediates...")
+    print(f"    Train: {len(train_trials)} trials")
+    train_trial_cats = _load_all_trial_categories(train_trials)
+
+    print(f"    Val: {len(val_trials)} trials")
+    val_trial_cats = _load_all_trial_categories(val_trials)
+
+    # Verify consistent dimensions across trials
+    _verify_category_dims(train_trial_cats, "train")
+    _verify_category_dims(val_trial_cats, "val")
+
+    # ── Step 3: Compute normalization from training data only ─────
+    print(f"\n  Computing global normalization (training trials)...")
+    norm_params = _compute_global_normalization(train_trial_cats)
+
+    # Apply to both train and val (val uses training statistics — no leakage)
+    _normalize_trial_categories(train_trial_cats, norm_params)
+    _normalize_trial_categories(val_trial_cats, norm_params)
+
+    # ── Step 4: Build window-to-trial mappings ────────────────────
+    print(f"\n  Building window-trial alignment...")
+    train_map = _build_window_trial_map(train_trials)
+    val_map = _build_window_trial_map(val_trials)
+
+    print(f"    Train: {len(train_map)} windows from "
+          f"{len(train_trials)} trials")
+    print(f"    Val:   {len(val_map)} windows from "
+          f"{len(val_trials)} trials")
+
+    # Verify window counts match spike data
+    n_spike_train = train_data['X_train'].shape[0]
+    n_spike_val = val_data['X_val'].shape[0]
+
+    if len(train_map) != n_spike_train:
+        raise ValueError(
+            f"ALIGNMENT ERROR: Spike data has {n_spike_train} train windows "
+            f"but bio mapping has {len(train_map)}. "
+            f"Trial parsing order diverged between ar3_data_loader and "
+            f"bio_data_loader!"
+        )
+    if len(val_map) != n_spike_val:
+        raise ValueError(
+            f"ALIGNMENT ERROR: Spike data has {n_spike_val} val windows "
+            f"but bio mapping has {len(val_map)}. "
+            f"Trial parsing order diverged!"
+        )
+
+    print(f"    Window counts verified: "
+          f"train={n_spike_train}, val={n_spike_val}")
+
+    # ── Step 5: Create datasets and dataloaders ───────────────────
+    seq_len = train_data['X_train'].shape[1]
+
+    Y_binary_train = train_data.get(
+        'Y_binary_train',
+        (train_data['Y_train'] > 0.5).astype(np.float32)
+    )
+    Y_binary_val = val_data.get(
+        'Y_binary_val',
+        (val_data['Y_val'] > 0.5).astype(np.float32)
+    )
+
     train_dataset = BioAlignedDataset(
         X=train_data['X_train'],
         Y=train_data['Y_train'],
-        Y_binary=train_data.get('Y_binary_train',
-                                (train_data['Y_train'] > 0.5).astype(np.float32)),
-        bio_ground_truth=bio_gt,
-        seq_len=train_data['X_train'].shape[1],
+        Y_binary=Y_binary_train,
+        trial_categories=train_trial_cats,
+        window_trial_map=train_map,
+        seq_len=seq_len,
     )
 
     val_dataset = BioAlignedDataset(
         X=val_data['X_val'],
         Y=val_data['Y_val'],
-        Y_binary=val_data.get('Y_binary_val',
-                              (val_data['Y_val'] > 0.5).astype(np.float32)),
-        bio_ground_truth=bio_gt,
-        seq_len=val_data['X_val'].shape[1],
+        Y_binary=Y_binary_val,
+        trial_categories=val_trial_cats,
+        window_trial_map=val_map,
+        seq_len=seq_len,
     )
 
     train_loader = DataLoader(
@@ -274,8 +481,41 @@ def create_bio_dataloaders(train_data, val_data, bio_gt,
     )
 
     bio_dims = train_dataset.get_bio_dims()
-    print(f"  [bio_loader] Bio dims: {bio_dims}")
-    print(f"  [bio_loader] Train: {len(train_dataset)} windows, "
+
+    print(f"\n  Bio-aligned data ready:")
+    print(f"    Categories: {bio_dims}")
+    print(f"    Total bio vars: {sum(bio_dims.values())}")
+    print(f"    Train: {len(train_dataset)} windows, "
           f"Val: {len(val_dataset)} windows")
 
-    return train_loader, val_loader, bio_dims
+    data_info = {
+        'input_dim': int(train_data['X_train'].shape[-1]),
+        'output_dim': int(train_data['Y_train'].shape[-1]),
+        'n_train': len(train_dataset),
+        'n_val': len(val_dataset),
+        'norm_params': {k: {kk: vv.tolist() for kk, vv in v.items()}
+                        for k, v in norm_params.items()},
+    }
+
+    return train_loader, val_loader, bio_dims, bio_gt, data_info
+
+
+def _verify_category_dims(trial_cats, split_name):
+    """Verify all trials have consistent category dimensions."""
+    if not trial_cats:
+        return
+
+    ref_dims = {cat: data.shape[1]
+                for cat, data in trial_cats[0].items()}
+
+    for i, trial_cat in enumerate(trial_cats[1:], 1):
+        for cat_name, data in trial_cat.items():
+            if data.shape[1] != ref_dims.get(cat_name, data.shape[1]):
+                raise ValueError(
+                    f"Dimension mismatch in {split_name} trial {i}: "
+                    f"{cat_name} has {data.shape[1]} vars but trial 0 "
+                    f"has {ref_dims[cat_name]}"
+                )
+
+    print(f"    {split_name}: all {len(trial_cats)} trials have "
+          f"consistent dims: {ref_dims}")

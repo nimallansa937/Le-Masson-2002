@@ -9,6 +9,11 @@ Measures BOTH spike prediction quality AND biological variable encoding:
   5. Per-category breakdown (tc_gating vs nrt_state vs synaptic)
   6. GRU-ODE gate analysis (which dims became "dedicated" to biology)
 
+CRITICAL FIX (v2): Uses per-window bio targets from the data loader
+instead of a single canonical trial's bio variables. This ensures each
+window's latent trajectory is compared against its ACTUAL matched bio
+dynamics, not misaligned dynamics from a different trial/GABA level.
+
 The gate analysis is particularly interesting: in A-R3 (spike-only),
 25/32 dims had update gate > 0.7 (static). If the bio loss "recruits"
 these static dims for biological encoding, we should see more dims with
@@ -43,26 +48,38 @@ VAR_TO_CATEGORY = {
     'gabaa_per_tc': 'synaptic', 'gabab_per_tc': 'synaptic',
 }
 
+# Ordered within each category (must match bio_data_loader.CATEGORY_VARS)
+CATEGORY_VARS = {
+    'tc_gating': ['tc_m_T', 'tc_h_T', 'tc_m_h'],
+    'nrt_state': ['nrt_m_Ts', 'nrt_h_Ts', 'V_nrt'],
+    'synaptic': ['gabaa_per_tc', 'gabab_per_tc'],
+}
+
+# Category order for concatenation (must be consistent)
+CATEGORY_ORDER = ['tc_gating', 'nrt_state', 'synaptic']
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Main evaluation function
 # ─────────────────────────────────────────────────────────────────────
 
-def evaluate_bio_recovery(model, val_loader, bio_ground_truth, device='cuda',
-                          n_windows_eval=10):
+def evaluate_bio_recovery(model, val_loader, bio_ground_truth=None,
+                          device='cuda', n_windows_eval=10):
     """
     Full evaluation suite for A-R3b experiment.
 
-    Extracts latent trajectories from validation data, then runs all
-    alignment metrics against biological ground truth.
+    Extracts latent trajectories from validation data and compares them
+    against biological ground truth. Uses per-window bio targets from
+    the data loader for correct alignment.
 
     Args:
         model: trained GRUODEBio instance
         val_loader: DataLoader yielding (x, y, y_binary, bio_targets)
-        bio_ground_truth: dict from load_ar2_data() — raw bio variable arrays
+        bio_ground_truth: OPTIONAL dict from load_ar2_data() — used only
+            as fallback if data loader doesn't provide bio targets.
+            The preferred path uses bio targets directly from val_loader.
         device: compute device
-        n_windows_eval: number of validation windows to use for eval
-                        (more = more accurate but slower)
+        n_windows_eval: max batches to evaluate (more = more accurate)
 
     Returns:
         results: dict with all metrics and per-category breakdowns
@@ -70,10 +87,11 @@ def evaluate_bio_recovery(model, val_loader, bio_ground_truth, device='cuda',
     model.eval()
     model = model.to(device)
 
-    # 1. Extract latent trajectories and spike predictions
+    # 1. Extract latent trajectories, spike predictions, and bio targets
     all_latents = []
     all_spike_preds = []
     all_spike_targets = []
+    all_bio_targets = {}   # cat_name -> list of (batch, T, n_vars) arrays
 
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
@@ -87,32 +105,50 @@ def evaluate_bio_recovery(model, val_loader, bio_ground_truth, device='cuda',
             all_spike_preds.append(torch.sigmoid(spike_pred).cpu().numpy())
             all_spike_targets.append(y.numpy())
 
-    latents = np.concatenate(all_latents, axis=0)      # (N, T, latent_dim)
+            # Collect per-window bio targets from the data loader
+            for cat_name, cat_tensor in bio.items():
+                if cat_name not in all_bio_targets:
+                    all_bio_targets[cat_name] = []
+                all_bio_targets[cat_name].append(cat_tensor.numpy())
+
+    latents = np.concatenate(all_latents, axis=0)       # (N, T, latent_dim)
     spike_preds = np.concatenate(all_spike_preds, axis=0)
     spike_targets = np.concatenate(all_spike_targets, axis=0)
 
-    # Use first window's latents for detailed analysis
-    # Shape: (T, latent_dim) from first validation window
-    z_flat = latents[0]
+    N, T, latent_dim = latents.shape
+    print(f"  Evaluation: {N} windows × {T} timesteps, latent_dim={latent_dim}")
+
+    # Flatten latents across all windows and time: (N*T, latent_dim)
+    z_flat = latents.reshape(-1, latent_dim)
 
     # 2. Spike correlation
     spike_corr = compute_spike_correlation(spike_preds, spike_targets)
 
-    # 3. Prepare biological variable matrix
-    T_eval = z_flat.shape[0]
-    bio_matrix, bio_names = flatten_bio_variables(bio_ground_truth, T=T_eval)
+    # 3. Build bio variable matrix from loader targets (properly aligned)
+    bio_matrix, bio_names = _build_bio_matrix_from_loader(
+        all_bio_targets, N, T
+    )
+
+    # Fallback to legacy bio_ground_truth if loader didn't provide targets
+    if bio_matrix is None and bio_ground_truth is not None:
+        print("  WARNING: No bio targets from loader, falling back to bio_gt")
+        bio_matrix, bio_names = flatten_bio_variables(bio_ground_truth, T=T)
 
     if bio_matrix is None or bio_matrix.shape[1] == 0:
         print("  WARNING: No bio variables found for evaluation")
         return {
             'spike_corr': spike_corr,
-            'pearson': {'n_above_05': 0, 'n_above_08': 0, 'max_r': 0.0},
-            'ridge': {'mean_r2': 0.0, 'decodable_025': 0, 'decodable_050': 0,
-                      'total': 0, 'by_category': {}},
+            'pearson': {'mean_max_r': 0.0, 'n_above_05': 0,
+                        'n_above_08': 0, 'max_r': 0.0, 'total': 0},
+            'ridge': {'mean_r2': 0.0, 'decodable_025': 0,
+                      'decodable_050': 0, 'total': 0, 'by_category': {}},
             'cka': 0.0,
             'mi': {'mean_mi': 0.0, 'max_mi': 0.0},
             'gates': {},
         }
+
+    print(f"  Bio matrix: {bio_matrix.shape} "
+          f"({len(bio_names)} named variables)")
 
     # 4. Pearson correlations (for comparison with A-R3)
     pearson_results = compute_pearson_recovery(z_flat, bio_matrix, bio_names)
@@ -139,6 +175,61 @@ def evaluate_bio_recovery(model, val_loader, bio_ground_truth, device='cuda',
     }
 
     return results
+
+
+def _build_bio_matrix_from_loader(all_bio_targets, N, T):
+    """Build (N*T, n_vars) bio matrix from data loader's per-window targets.
+
+    Args:
+        all_bio_targets: dict of cat_name -> list of (batch, T, n_vars) arrays
+        N: total number of windows collected
+        T: timesteps per window
+
+    Returns:
+        bio_matrix: (N*T, total_vars) or None if no targets available
+        bio_names: list of 'var_name:neuron_idx' strings
+    """
+    if not all_bio_targets:
+        return None, []
+
+    bio_flat_list = []
+    bio_names = []
+
+    for cat_name in CATEGORY_ORDER:
+        if cat_name not in all_bio_targets:
+            continue
+
+        # Concatenate batches: list of (batch_size, T, n_vars) → (N, T, n_vars)
+        cat_data = np.concatenate(all_bio_targets[cat_name], axis=0)
+
+        # Verify shape consistency
+        if cat_data.shape[0] != N:
+            # Some batches may have fewer samples (last batch)
+            cat_data = cat_data[:N]
+
+        # Flatten to (N*T, n_vars)
+        cat_flat = cat_data.reshape(-1, cat_data.shape[-1])
+        bio_flat_list.append(cat_flat)
+
+        # Generate variable names in the same order as concatenation
+        var_names = CATEGORY_VARS.get(cat_name, [])
+        n_neurons = 20  # Fixed for this circuit model
+        for var_name in var_names:
+            for neuron in range(n_neurons):
+                bio_names.append(f"{var_name}:{neuron}")
+
+    if not bio_flat_list:
+        return None, []
+
+    bio_matrix = np.concatenate(bio_flat_list, axis=1)  # (N*T, total_vars)
+
+    # Verify name count matches
+    if len(bio_names) != bio_matrix.shape[1]:
+        print(f"  WARNING: bio_names ({len(bio_names)}) != "
+              f"bio_matrix cols ({bio_matrix.shape[1]}), truncating names")
+        bio_names = bio_names[:bio_matrix.shape[1]]
+
+    return bio_matrix, bio_names
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -365,7 +456,8 @@ def compute_mutual_info(latents, bio_matrix, top_k=20):
     try:
         from sklearn.feature_selection import mutual_info_regression
     except ImportError:
-        return {'mean_mi': 0.0, 'max_mi': 0.0, 'error': 'sklearn not available'}
+        return {'mean_mi': 0.0, 'max_mi': 0.0,
+                'error': 'sklearn not available'}
 
     n_bio = bio_matrix.shape[1]
     bio_var = np.var(bio_matrix, axis=0)
@@ -380,11 +472,20 @@ def compute_mutual_info(latents, bio_matrix, top_k=20):
     sorted_idx = valid_indices[np.argsort(bio_var[valid_indices])[::-1]]
     top_indices = sorted_idx[:top_k]
 
-    X = latents  # (T, latent_dim)
-    mi_scores = {}
+    # Subsample for speed if dataset is large (MI with k-NN is O(n*k*d))
+    n_samples = latents.shape[0]
+    if n_samples > 5000:
+        subsample_idx = np.random.RandomState(42).choice(
+            n_samples, 5000, replace=False)
+        X = latents[subsample_idx]
+        bio_sub = bio_matrix[subsample_idx]
+    else:
+        X = latents
+        bio_sub = bio_matrix
 
+    mi_scores = {}
     for bio_idx in top_indices:
-        y = bio_matrix[:, bio_idx]
+        y = bio_sub[:, bio_idx]
         if np.std(y) < 1e-10:
             continue
         mi = mutual_info_regression(X, y, n_neighbors=5, random_state=42)
@@ -488,10 +589,13 @@ def analyze_gru_gates(model, val_loader, device):
 
 def flatten_bio_variables(bio_gt, T):
     """
-    Flatten all bio variable groups into a single (T, N_vars) matrix.
+    LEGACY: Flatten bio_gt dict into a single (T, N_vars) matrix.
 
     Uses bare-name variables (canonical trial) when available.
     Falls back to first GABA-specific version if bare name missing.
+
+    NOTE: This is the old approach that uses a single canonical trial.
+    Prefer using bio targets from the data loader for correct alignment.
 
     Returns:
         bio_matrix: (T, n_vars) numpy array, or None if no vars found
@@ -522,7 +626,8 @@ def flatten_bio_variables(bio_gt, T):
                 trace = trace[:T]
             else:
                 # Pad with last value if too short
-                pad = np.full(T - len(trace), trace[-1] if len(trace) > 0 else 0)
+                pad = np.full(T - len(trace),
+                              trace[-1] if len(trace) > 0 else 0)
                 trace = np.concatenate([trace, pad])
 
             bio_matrix.append(trace)

@@ -43,8 +43,7 @@ from pathlib import Path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
-from data.ar3_data_loader import load_ar2_data
-from data.bio_data_loader import create_bio_dataloaders
+from data.bio_data_loader import load_bio_aligned_data
 from architectures.gru_ode_bio import GRUODEBio
 from training.bio_loss import CombinedBioLoss
 from training.train_bio import train_gru_ode_bio
@@ -137,39 +136,18 @@ Examples:
     print("  LOADING DATA")
     print("="*70)
 
-    train_data, val_data, bio_gt = load_ar2_data(args.data_dir)
-
-    print(f"\n  Train: X={train_data['X_train'].shape}, Y={train_data['Y_train'].shape}")
-    print(f"  Val:   X={val_data['X_val'].shape}, Y={val_data['Y_val'].shape}")
-    print(f"  Bio GT: {len(bio_gt)} variable groups")
-
-    # Count actual bio vars available
-    from data.bio_data_loader import VAR_TO_CATEGORY
-    available_vars = [k for k in VAR_TO_CATEGORY.keys() if k in bio_gt]
-    missing_vars = [k for k in VAR_TO_CATEGORY.keys() if k not in bio_gt]
-    if missing_vars:
-        # Try GABA-specific fallback
-        for var in list(missing_vars):
-            for key in bio_gt.keys():
-                if key.startswith(var + '_gaba'):
-                    available_vars.append(var)
-                    missing_vars.remove(var)
-                    break
-
-    print(f"  Available bio vars: {len(available_vars)}/8 groups")
-    if missing_vars:
-        print(f"  Missing: {missing_vars}")
-
-    # Create bio-aligned data loaders (used for all alpha conditions)
-    print("\n  Creating bio-aligned data loaders...")
-    train_loader, val_loader, bio_dims = create_bio_dataloaders(
-        train_data, val_data, bio_gt,
-        batch_size=args.batch_size, num_workers=0
-    )
+    # Load data with per-trial bio alignment (the critical fix)
+    # Each training window gets bio targets from its OWN source trial
+    # at its OWN temporal offset — not from a shared canonical trial
+    train_loader, val_loader, bio_dims, bio_gt, data_info = \
+        load_bio_aligned_data(
+            args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=0,
+        )
 
     total_bio_vars = sum(bio_dims.values())
-    print(f"  Bio categories: {bio_dims}")
-    print(f"  Total bio variables: {total_bio_vars}")
+    print(f"\n  Bio GT (legacy): {len(bio_gt)} variable groups")
 
     # Save experiment config
     config = {
@@ -185,10 +163,10 @@ Examples:
         'seed': args.seed,
         'device': args.device,
         'bio_dims': bio_dims,
-        'train_windows': len(train_loader.dataset),
-        'val_windows': len(val_loader.dataset),
-        'input_dim': int(train_data['X_train'].shape[-1]),
-        'output_dim': int(train_data['Y_train'].shape[-1]),
+        'train_windows': data_info['n_train'],
+        'val_windows': data_info['n_val'],
+        'input_dim': data_info['input_dim'],
+        'output_dim': data_info['output_dim'],
     }
     with open(output_dir / 'experiment_config.json', 'w') as f:
         json.dump(config, f, indent=2)
@@ -214,8 +192,8 @@ Examples:
         # For alpha=1.0 (spike-only), still create bio heads for
         # post-hoc evaluation — but loss ignores them during training
         model = GRUODEBio(
-            input_dim=train_data['X_train'].shape[-1],
-            output_dim=train_data['Y_train'].shape[-1],
+            input_dim=data_info['input_dim'],
+            output_dim=data_info['output_dim'],
             latent_dim=args.latent_dim,
             hidden_dim=args.hidden_dim,
             bio_dims=bio_dims,  # Always include for consistent evaluation
@@ -260,9 +238,13 @@ Examples:
         )
 
         # === Evaluate ===
+        # bio_gt is legacy fallback — the val_loader now provides properly
+        # aligned per-window bio targets (the critical alignment fix)
         print("\n  Running evaluation suite...")
         eval_results = evaluate_bio_recovery(
-            model, val_loader, bio_gt, device=args.device
+            model, val_loader,
+            bio_ground_truth=bio_gt,  # Legacy fallback only
+            device=args.device,
         )
 
         # Print summary
