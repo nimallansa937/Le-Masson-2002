@@ -211,7 +211,7 @@ def align_bio_matrix(bio_ground_truth: Dict, registry, target_T: int) -> np.ndar
 def train_gru_ode(model: nn.Module, train_data: Dict, val_data: Dict,
                   device: str = 'cuda', max_hours: float = 2.0,
                   lr: float = 5e-4, batch_size: int = 32,
-                  max_epochs: int = 300, patience: int = 30):
+                  max_epochs: int = 300, patience: int = 40):
     """Train GRU-ODE with progressive sequence length schedule."""
     model = model.to(device)
 
@@ -226,7 +226,7 @@ def train_gru_ode(model: nn.Module, train_data: Dict, val_data: Dict,
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-6
+        optimizer, mode='min', patience=20, factor=0.5, min_lr=1e-5
     )
     bce_fn = nn.BCELoss()
     mse_fn = nn.MSELoss()
