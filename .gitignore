@@ -8,3 +8,12 @@ results.json
 *.egg-info/
 .DS_Store
 Thumbs.db
+
+# Large binary data — regenerable from HDF5 + checkpoints
+a_r3b_reanalysis/data/
+a_r3b_reanalysis/results/a_r3b_full_results_incremental.csv
+
+# Rung 3 data/checkpoints (too large for git)
+rung3_checkpoints/
+rung3_data/
+rung3_figures/

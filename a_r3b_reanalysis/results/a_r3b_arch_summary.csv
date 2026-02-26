@@ -1,0 +1,4 @@
+architecture,verdict,confidence,n_tier1_ridge_encoding,n_tier1_ridge_structural,n_tier1_ridge_zombie,n_tier1_encoding,n_tier1_zombie,n_tier1_total,best_r2_ridge,best_r2_mlp1,best_r2_mlp2,n_total_results
+lstm,WEAK_ENCODING,0.1,4,36,0,48,2,120,0.5921076374895432,0.40026042901856057,0.43673856319750054,255
+neural_ode,AMBIGUOUS,0.0,0,15,10,0,65,120,0.15251744550817148,0.0038989780374857536,-0.03635077986597454,255
+volterra,STRUCTURAL_ZOMBIE,1.0,0,40,0,4,3,120,0.6224116631115184,0.6362568769823103,0.24095435177578645,255
