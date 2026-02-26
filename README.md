@@ -56,7 +56,7 @@ Three surrogate architectures trained on circuit trajectory data:
 | **LSTM** | Recurrent neural network | 256 hidden units | PyTorch (SGD) |
 | **Neural ODE** | Continuous-time dynamics | 64 hidden units | PyTorch + torchdiffeq |
 
-Original A-R3 test: CCA probes for 160 biological state variables. Result: Volterra recovers 4/160, LSTM and Neural ODE recover 0/160.
+Original A-R3 test (linear probes only): Volterra recovers 4/160, LSTM and Neural ODE recover 0/160. **Reversed by A-R3b** -- see Key Result below.
 
 ---
 
@@ -118,21 +118,62 @@ Pipeline phases:
 
 ---
 
-## Key Result: All Three Architectures Are Zombies
+## Key Result: A Dramatic Reversal
 
-The A-R3b reanalysis reveals that **no architecture genuinely learns biological variables**. The untrained baseline control (Gate 7) is the critical methodological contribution.
+The A-R3b reanalysis **reverses the original A-R3 conclusions**. The headline numbers from averaging across probe types were misleading -- the per-target, per-neuron, per-probe breakdown tells a completely different story.
 
-| Architecture | Verdict | Ridge R2_trained | Delta R2 | Selectivity |
+### The Reversal
+
+| | A-R3 Claim | A-R3b Finding |
+|---|---|---|
+| **LSTM** | Zombie (0/160) | **Nonlinear encoder** (48/120 Tier 1) |
+| **Volterra** | Not zombie (4/160) | **Structural zombie** (0/120 genuine) |
+| **Architecture matters?** | Yes (Volterra > LSTM) | Yes, but **reversed** (LSTM > Volterra) |
+
+### LSTM: Genuine Nonlinear Encoder -- NOT a Zombie
+
+Ridge finds encoding in only 11 probes (all from neuron 0). But MLP-1 reveals **68 individual probes with Delta R2 > 0.05**, spanning 13 of 17 targets across all 5 neurons, every one passing selectivity (p = 0.048):
+
+| Target | Timescale (ms) | MLP-1 Delta R2 | All 5 neurons? | Selectivity |
 |---|---|---|---|---|
-| **Volterra** | STRUCTURAL ZOMBIE (100%) | 0.622 | 0.000 | 0.470 |
-| **LSTM** | Weak encoding (10%) | 0.592 | +0.004 | 0.442 |
-| **Neural ODE** | Ambiguous | 0.153 | +0.032 | 0.006 |
+| I_GABA_B | 150 | 0.240 | Yes (0.17-0.29) | 0.096 |
+| I_T | 5 | 0.155 | Yes (0.10-0.24) | 0.465 |
+| tc_h_T | 20 | 0.134 | Yes (0.10-0.16) | 0.587 |
+| tc_m_h | 100 | 0.132 | Yes (0.12-0.15) | 0.473 |
+| I_h | 100 | 0.125 | Yes (0.10-0.15) | 0.507 |
+| tc_m_T | 1 | 0.114 | Yes (0.10-0.12) | 0.509 |
+| G_T | 5 | 0.106 | Yes (0.06-0.16) | 0.464 |
+| gabaa_per_tc | 5 | 0.071 | 4/5 neurons | 0.088 |
 
-**Volterra**: Delta R2 = 0.000 across all 17 targets and 5 neurons. The Laguerre basis convolution passes through temporal structure identically whether trained or not. The original A-R3 finding of 4/160 recovered variables was a false positive.
+The encoding is genuinely there -- it's just **nonlinear**. The LSTM stores biological variables in nonlinearly distributed representations across 256 hidden dimensions. Ridge can't decode this; a single-layer MLP can.
 
-**LSTM**: 90% structural (trained equals untrained). Only TC neuron 0 shows Delta R2 in the range of 0.06-0.10 for a few targets, a weak single-neuron effect.
+### Volterra: Structural Zombie -- Confirmed
 
-**Neural ODE**: Most targets are not encoded (R2 less than 0.1). Three GABA targets show genuine Delta R2 of 0.08-0.21, but with near-zero temporal selectivity, meaning the encoding is distributional rather than temporal.
+Delta R2 = 0.000 for **every single Ridge probe** across all 17 targets and 5 neurons. MLP finds encoding in exactly one variable: G_h (4 neurons, Delta R2 = 0.06-0.40). Everything else is structural passthrough from the Laguerre basis. Verdict: STRUCTURAL_ZOMBIE, confidence 1.0. The original A-R3 finding of 4/160 recovered variables was a **false positive** -- the untrained network achieves identical R2.
+
+### Neural ODE: Genuine Zombie -- Confirmed
+
+Nothing found by any probe. The one possible signal (I_GABA_B Ridge Delta R2 ~ 0.10) has selectivity = 0.001, meaning temporal alignment doesn't matter -- it's spurious, correctly flagged. The 64-dimensional hidden state is too compressed to encode anything.
+
+### Why A-R3 Got It Backwards
+
+The original A-R3 used only linear probes (Ridge) and had no untrained baseline. This created two blind spots:
+
+1. **Missed LSTM's nonlinear encoding.** The LSTM genuinely learns biological variables, but stores them in nonlinearly distributed representations. Ridge can't decode this; MLP can. Without the MLP probe ladder, this encoding is invisible.
+2. **Mistook Volterra's structural passthrough for learned encoding.** The Laguerre basis functions structurally overlap with biological timescales. High R2 looked like recovery but Delta R2 = 0.000 -- the untrained network does identically. Without the untrained baseline (Gate 7), this artifact is undetectable.
+
+### Three Novel Findings
+
+1. **Encoding is nonlinear, not linear.** The probe complexity ladder works as designed: Ridge sees nothing, MLP-1 finds strong signal, MLP-2 overfits. The encoding exists but is distributed across dimensions in a nonlinear manifold.
+
+2. **The G_h catastrophe.** Both LSTM and Volterra show extreme MLP instability for G_h specifically (Delta R2 = -1.57 for LSTM MLP-1, -1.10 for Volterra MLP-2). Yet I_h (= G_h x driving force) is perfectly recoverable. The network encodes the **current**, not the conductance -- a functional rather than mechanistic encoding.
+
+3. **Neuron 0 is special.** All 11 Ridge-level encodings come from neuron_idx = 0. This TC neuron has a partially linear encoding, while the other 4 require nonlinear readout. Individual neurons in the circuit may be represented differently in the hidden state.
+
+### Caveats
+
+- **Permutation granularity**: With 20 permutations, the minimum p-value is 1/21 = 0.048. Every passing probe shows exactly this value. More permutations (100+) would give resolution, though consistency across 68 probes makes mass false positives unlikely.
+- **MLP overfitting risk**: The G_h catastrophe shows MLPs can go wrong. The Volterra control is reassuring -- if MLP-1 were systematically overfitting, it would find false encoding in Volterra too. It doesn't (except G_h).
 
 ---
 
@@ -284,6 +325,12 @@ le_masson_replication/
 
 **Rung 1 (Primary)**: Bifurcation threshold of the all-computational circuit matches Le Masson's hybrid result (29 +/- 4.2 nS).
 
-**Rung 3 + A-R3b (Zombie Test)**: Do trained surrogates encode biological dynamics beyond what untrained networks provide structurally? **Result: No.** Delta R2 is approximately 0 for all architectures.
+**Rung 3 + A-R3b (Zombie Test)**: Do trained surrogates encode biological dynamics beyond what untrained networks provide structurally?
 
-**Interpretation**: The computational surrogates replicate input-output behavior but do not internally represent the biological state variables. They are functional replicas, not mechanistic models. This distinction is central to the DESCARTES thesis on substrate independence.
+**Result: It depends on the architecture and the decoder.**
+
+- **LSTM**: Yes. 68 probes across 13/17 targets show genuine learned encoding (Delta R2 > 0.05, all passing selectivity). But the encoding is **nonlinear** -- invisible to the linear probes used in A-R3.
+- **Volterra**: No. Delta R2 = 0.000 universally. Structural passthrough only.
+- **Neural ODE**: No. 64-dim hidden state too compressed for biological encoding.
+
+**Interpretation**: The LSTM preserves biological information but in a **transformed format** -- a nonlinear manifold that maintains functional correspondence while restructuring internal representation. A linear reader misses it; a nonlinear reader recovers it. The Volterra achieves high R2 through structural passthrough, not learning. This distinction -- between genuinely learned nonlinear encoding and structural artifact -- is precisely what the A-R3b methodology (untrained baselines + probe ladder + selectivity) was designed to detect. The original A-R3 linear-only analysis got the answer exactly backwards.
